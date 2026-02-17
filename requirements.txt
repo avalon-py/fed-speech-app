@@ -3,6 +3,7 @@ yfinance
 pandas
 numpy
 scikit-learn
+torch
 transformers
 joblib
 requests
