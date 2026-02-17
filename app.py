@@ -27,10 +27,11 @@ def get_finbert():
 def get_feature_columns():
     return joblib.load("models/feature_columns.pkl")
 
-ml_models   = get_models()
-tokenizer, bert_model = get_finbert()
+ml_models       = get_models()
+tokenizer       = get_finbert()
 feature_columns = get_feature_columns()
-fred_api_key = st.secrets["FRED_API_KEY"]
+fred_api_key    = st.secrets["FRED_API_KEY"]
+hf_token        = st.secrets["HF_TOKEN"]
 
 # ── UI ─────────────────────────────────────────────────────────────────────
 st.title("🏦 Fed Speech Market Impact Analyzer")
@@ -62,7 +63,7 @@ with col2:
     st.caption(f"Using date: **{speech_date}**")
     st.divider()
     st.markdown("**How it works**")
-    st.caption("1. Speech → FinBERT embedding")
+    st.caption("1. Speech → FinBERT embedding via HuggingFace API")
     st.caption("2. Fetch price history from Yahoo Finance")
     st.caption("3. Fetch macro data from FRED")
     st.caption("4. Run through trained models")
@@ -81,7 +82,7 @@ if run:
                     text=speech_text,
                     date=datetime.combine(speech_date, datetime.min.time()),
                     tokenizer=tokenizer,
-                    bert_model=bert_model,
+                    hf_token=hf_token,      # ← fixed: was bert_model
                     ml_models=ml_models,
                     feature_columns=feature_columns,
                     fred_api_key=fred_api_key
@@ -90,7 +91,6 @@ if run:
                 st.success("Prediction complete!")
                 st.divider()
 
-                # ── Results display ────────────────────────────────────────
                 assets = {
                     "📈 S&P 500 (SPX)": ["SPX_t+3", "SPX_t+7", "SPX_t+30"],
                     "🥇 Gold (GOLD)":    ["GOLD_t+3", "GOLD_t+7", "GOLD_t+30"],
@@ -103,9 +103,9 @@ if run:
                 for i, (asset_name, horizons) in enumerate(assets.items()):
                     with cols[i]:
                         st.markdown(f"**{asset_name}**")
-                        for col in horizons:
-                            pred  = results[col]
-                            label = col.split("_")[1]   # t+3, t+7, t+30
+                        for horizon in horizons:
+                            pred  = results[horizon]
+                            label = horizon.split("_")[1]
                             pct   = pred * 100
 
                             if pred > 0:
@@ -113,7 +113,6 @@ if run:
                             else:
                                 st.metric(label, f"{pct:.2f}%", delta="Bearish ↓", delta_color="inverse")
 
-                # ── Raw predictions ────────────────────────────────────────
                 with st.expander("Raw prediction values"):
                     results_df = pd.DataFrame([results]).T
                     results_df.columns = ["Predicted Return"]
