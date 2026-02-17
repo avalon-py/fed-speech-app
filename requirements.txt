@@ -4,7 +4,6 @@ pandas
 numpy
 scikit-learn
 transformers
-torch
 joblib
 requests
 fredapi
