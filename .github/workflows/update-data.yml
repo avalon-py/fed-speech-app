@@ -1,0 +1,32 @@
+name: Update Market Data Cache
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily — a few hours after US market close, buffer for data finalization
+  workflow_dispatch:        # lets you trigger it manually too, useful for testing
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install fredapi yfinance pandas
+
+      - name: Fetch and validate data
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python scripts/update_data.py
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/market_data.csv
+          git diff --quiet --cached || git commit -m "Update market data cache [automated]"
+          git push
