@@ -36,9 +36,15 @@ PRICE_PATH = os.path.join(DATASET_DIR, "price_action.csv")
 # and some FRED series get revised, so re-pulling is safer than trusting
 # old rows). For prices, a generous trailing window is enough — we only
 # need to *extend* the existing calendar-filled history, not rebuild it.
-MACRO_START = "1996-01-01"
-PRICE_LOOKBACK_DAYS = 400  # comfortably covers the 30-day rolling windows
-                           # plus buffer for holidays/gaps/late releases
+MACRO_START = "1996-01-01"  # floor used only when NO existing CSV is found at all
+LOOKBACK_DAYS = 400  # comfortably covers the 30-day rolling windows, quarterly
+                      # GDP releases, and enough buffer to self-heal any run
+                      # that got skipped (holiday, Action failure, etc.)
+MACRO_FFILL_PAD_DAYS = 120  # extra run-in fetched (not merged as "new" per se,
+                             # just included) so ffill has a real prior value
+                             # right at the edge of the window — otherwise the
+                             # first few rows of a monthly/quarterly series can
+                             # come back NaN before their first in-window release
 
 TICKERS = {
     "SPX": "^GSPC",
@@ -62,28 +68,44 @@ def fail(msg: str) -> None:
 # Macro indicators (FRED)
 # ---------------------------------------------------------------------------
 
-def fetch_macro(today: pd.Timestamp) -> pd.DataFrame:
+def fetch_macro(today: pd.Timestamp, fetch_start: pd.Timestamp) -> pd.DataFrame:
+    """Fetch only a recent window from FRED (observation_start), not full
+    history. `fetch_start` is a rolling lookback (see main()), NOT a fixed
+    1996 floor — that floor is only ever used the very first time this
+    script runs against a repo with no existing CSV at all.
+    """
     api_key = os.environ.get("FRED_API_KEY")
     if not api_key:
         fail("FRED_API_KEY env var is not set")
 
     fred = Fred(api_key=api_key)
+    obs_start = fetch_start.strftime("%Y-%m-%d")
 
-    unemp = fred.get_series("UNRATE").to_frame("unemployment")
-    ffr = fred.get_series("FEDFUNDS").to_frame("interest_rate")
-    gdp = fred.get_series("A191RL1Q225SBEA").to_frame("growth_rate")
+    unemp = fred.get_series("UNRATE", observation_start=obs_start).to_frame("unemployment")
+    ffr = fred.get_series("FEDFUNDS", observation_start=obs_start).to_frame("interest_rate")
+    gdp = fred.get_series("A191RL1Q225SBEA", observation_start=obs_start).to_frame("growth_rate")
 
     macro = pd.concat([unemp, ffr, gdp], axis=1).sort_index()
+
+    if macro.empty:
+        fail("FRED returned no rows in the lookback window — widen LOOKBACK_DAYS")
 
     # NOTE: intentionally NOT shifting here. FE_main.ipynb applies the
     # 30-day shift to unemployment/growth_rate (not interest_rate) itself,
     # AFTER loading this CSV. This script must keep producing the same raw,
     # unshifted series that training consumed, or the app's shift-at-inference
     # step will double-shift and silently corrupt every prediction.
+    #
+    # ffill needs a bit of run-in before fetch_start to correctly carry
+    # forward monthly/quarterly values that were last *released* before the
+    # window started — FRED's observation_start only limits what comes back,
+    # it doesn't change when a series was last updated. So we pad the ffill
+    # start a little earlier than fetch_start using merge_into_existing()
+    # in main(), not here; this function just returns what FRED gave us,
+    # calendar-filled across its own returned range.
     daily_range = pd.date_range(start=macro.index.min(), end=today, freq="D")
     macro_daily = macro.reindex(daily_range).ffill()
     macro_daily = macro_daily.reset_index().rename(columns={"index": "date"})
-    macro_daily = macro_daily[macro_daily["date"] >= MACRO_START].reset_index(drop=True)
 
     return macro_daily
 
@@ -115,7 +137,7 @@ def validate_macro(df: pd.DataFrame, today: pd.Timestamp) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_prices(today: pd.Timestamp) -> pd.DataFrame:
-    start = (today - timedelta(days=PRICE_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    start = (today - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     end = (today + timedelta(days=1)).strftime("%Y-%m-%d")  # yfinance end is exclusive
 
     data = {}
@@ -218,8 +240,22 @@ def main() -> None:
 
     os.makedirs(DATASET_DIR, exist_ok=True)
 
+    # Rolling lookback, NOT a fixed "since 1996" fetch. Only used as the
+    # actual floor if this is a brand new repo with no CSV yet at all.
+    have_macro_csv = os.path.exists(MACRO_PATH)
+    have_price_csv = os.path.exists(PRICE_PATH)
+
+    if have_macro_csv:
+        macro_fetch_start = today - timedelta(days=LOOKBACK_DAYS + MACRO_FFILL_PAD_DAYS)
+    else:
+        macro_fetch_start = pd.Timestamp(MACRO_START)
+        log("no existing macro CSV found — first run will pull full history once")
+
+    _ = have_price_csv  # price fetch always uses a fixed rolling window (see fetch_prices);
+                         # no special first-run case needed since 400 days is cheap either way
+
     # --- Macro ---
-    macro_fresh = fetch_macro(today)
+    macro_fresh = fetch_macro(today, macro_fetch_start)
     macro_combined = merge_into_existing(MACRO_PATH, macro_fresh)
     validate_macro(macro_combined, today)
 
