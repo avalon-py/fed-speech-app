@@ -2,11 +2,12 @@ name: Keep Streamlit Alive
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Runs every hour
-  workflow_dispatch:
+    # Runs at the start of every hour to reset the timer
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual triggers from GitHub UI
 
 jobs:
-  ping-app:
+  ping-and-wake:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -17,8 +18,9 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Selenium
-        run: pip install selenium
+      - name: Install Dependencies
+        run: |
+          pip install selenium
 
-      - name: Run wake up script
+      - name: Execute Smart Ping
         run: python scripts/ping.py
