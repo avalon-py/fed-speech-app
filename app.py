@@ -1,125 +1,117 @@
-import streamlit as st
-import pandas as pd
 import numpy as np
 import joblib
-from datetime import datetime, date
+import onnxruntime as ort
+from tokenizers import Tokenizer
+from datetime import datetime
 import os
 
-from predict import load_models, load_finbert, predict
+TARGET_COLS = [
+    "SPX_t+3",  "SPX_t+7",  "SPX_t+30",
+    "GOLD_t+3", "GOLD_t+7", "GOLD_t+30",
+    "VIX_t+3",  "VIX_t+7",  "VIX_t+30",
+    "TNX_t+3",  "TNX_t+7",  "TNX_t+30",
+]
 
-# ── Page config ────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Fed Speech Analyzer",
-    page_icon="🏦",
-    layout="wide"
-)
+FINBERT_ONNX_DIR = os.path.join("models", "finbert-onnx")
+MAX_LENGTH = 512
+STRIDE = 50
 
-# ── Load everything once (cached) ──────────────────────────────────────────
-@st.cache_resource
-def get_models():
-    return load_models("models")
 
-@st.cache_resource
-def get_finbert():
-    # Returns (tokenizer, onnxruntime.InferenceSession) - both loaded
-    # from models/finbert-onnx/ on disk, no network call.
-    return load_finbert("models/finbert-onnx")
+def load_models(models_dir: str = "models") -> dict:
+    return {
+        col: joblib.load(os.path.join(models_dir, f"{col}.pkl"))
+        for col in TARGET_COLS
+    }
 
-@st.cache_data
-def get_feature_columns():
-    return joblib.load("models/feature_columns.pkl")
 
-ml_models       = get_models()
-tokenizer, finbert_session = get_finbert()
-feature_columns = get_feature_columns()
+def load_finbert(onnx_dir: str = FINBERT_ONNX_DIR):
+    """
+    Loads the tokenizer + a local FP16 ONNX FinBERT session, both read
+    straight from disk. No torch, no transformers, no network call to
+    Hugging Face at runtime.
 
-# ── UI ─────────────────────────────────────────────────────────────────────
-st.title("🏦 Fed Speech Market Impact Analyzer")
-st.caption("Predicts SPX, GOLD, VIX, and TNX direction following Federal Reserve speeches")
+    Uses tokenizers.Tokenizer.from_file() against tokenizer.json directly
+    instead of transformers.AutoTokenizer - same vocab/merges, ~150-250MB
+    less import overhead, and no dependency on the transformers package
+    (huggingface-hub, safetensors, regex, tqdm, typer, etc.) at all.
+    """
+    tokenizer = Tokenizer.from_file(os.path.join(onnx_dir, "tokenizer.json"))
 
-st.divider()
+    # Match the old transformers call: truncation=True, max_length=512,
+    # stride=50, return_overflowing_tokens=True, padding=True
+    tokenizer.enable_truncation(max_length=MAX_LENGTH, stride=STRIDE, strategy="only_first")
 
-col1, col2 = st.columns([3, 1])
+    pad_id = tokenizer.token_to_id("[PAD]")
+    if pad_id is None:
+        pad_id = 0  # BERT-family vocabs put [PAD] at index 0 as a fallback
+    # Pad every chunk to MAX_LENGTH rather than "longest in batch" - matches
+    # the max_length cap already in play and keeps every ONNX input a fixed,
+    # predictable shape.
+    tokenizer.enable_padding(pad_id=pad_id, pad_token="[PAD]", length=MAX_LENGTH)
 
-with col1:
-    speech_text = st.text_area(
-        "Fed Speech Text",
-        height=300,
-        placeholder="Paste the Federal Reserve speech here..."
+    sess_options = ort.SessionOptions()
+    # Small Streamlit instances only get 1 CPU core anyway; keeping thread
+    # pools at 1 avoids onnxruntime spinning up extra threads that just
+    # burn RAM without speeding anything up.
+    sess_options.intra_op_num_threads = 1
+    sess_options.inter_op_num_threads = 1
+    # Default arena pre-allocates and grows greedily; disabling it trims
+    # peak RSS at a small cost to per-call alloc speed - worth it here
+    # given the 1GB ceiling.
+    sess_options.enable_cpu_mem_arena = False
+
+    session = ort.InferenceSession(
+        os.path.join(onnx_dir, "model_fp16.onnx"),
+        sess_options=sess_options,
+        providers=["CPUExecutionProvider"],
     )
 
-with col2:
-    st.markdown("**Speech Date**")
-    use_today = st.checkbox("Use today's date", value=True)
+    return tokenizer, session
 
-    speech_date = date.today()
-    if not use_today:
-        speech_date = st.date_input(
-            "Select date",
-            value=date.today(),
-            max_value=date.today()
-        )
 
-    st.caption(f"Using date: **{speech_date}**")
-    st.divider()
-    st.markdown("**How it works**")
-    st.caption("1. Speech → FinBERT embedding (local FP16 ONNX, CPU)")
-    st.caption("2. Price history read from dataset/price_action.csv (synced daily via cron)")
-    st.caption("3. Macro data read from dataset/macro_indicators.csv (synced daily via cron)")
-    st.caption("4. Run through trained models")
+def embed_speech(text: str, tokenizer, session) -> np.ndarray:
+    """
+    Same 512-token sliding-window chunking as before, run as a single
+    local batched ONNX forward pass. With tokenizers, overflow chunks
+    come back via Encoding.overflowing instead of a return_overflowing_tokens
+    kwarg - the truncation/padding config set once in load_finbert()
+    governs both.
+    """
+    encoding = tokenizer.encode(text)
+    all_encodings = [encoding] + encoding.overflowing
 
-st.divider()
+    input_ids = np.array([e.ids for e in all_encodings], dtype=np.int64)
+    attention_mask = np.array([e.attention_mask for e in all_encodings], dtype=np.int64)
+    token_type_ids = np.array([e.type_ids for e in all_encodings], dtype=np.int64)
 
-run = st.button("🔍 Analyze Speech", type="primary", use_container_width=True)
+    tokens = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "token_type_ids": token_type_ids,
+    }
 
-if run:
-    if not speech_text.strip():
-        st.error("Please enter a speech.")
-    else:
-        with st.spinner("Embedding speech and running predictions..."):
-            try:
-                results = predict(
-                    text=speech_text,
-                    date=datetime.combine(speech_date, datetime.min.time()),
-                    tokenizer=tokenizer,
-                    session=finbert_session,
-                    ml_models=ml_models,
-                    feature_columns=feature_columns,
-                )
+    # Only pass along the inputs this particular ONNX graph actually
+    # expects (e.g. some exports omit token_type_ids).
+    session_input_names = {inp.name for inp in session.get_inputs()}
+    feed = {name: arr for name, arr in tokens.items() if name in session_input_names}
 
-                st.success("Prediction complete!")
-                st.divider()
+    outputs = session.run(None, feed)
+    last_hidden_state = outputs[0]  # (num_chunks, seq_len, hidden)
 
-                assets = {
-                    "📈 S&P 500 (SPX)": ["SPX_t+3", "SPX_t+7", "SPX_t+30"],
-                    "🥇 Gold (GOLD)":    ["GOLD_t+3", "GOLD_t+7", "GOLD_t+30"],
-                    "😰 VIX":            ["VIX_t+3",  "VIX_t+7",  "VIX_t+30"],
-                    "💵 10Y Treasury":   ["TNX_t+3",  "TNX_t+7",  "TNX_t+30"],
-                }
+    cls_embeddings = last_hidden_state[:, 0, :].astype(np.float32)
+    return cls_embeddings.mean(axis=0)
 
-                cols = st.columns(4)
 
-                for i, (asset_name, horizons) in enumerate(assets.items()):
-                    with cols[i]:
-                        st.markdown(f"**{asset_name}**")
-                        for horizon in horizons:
-                            pred  = results[horizon]
-                            label = horizon.split("_")[1]
-                            pct   = pred * 100
+def predict(
+    text: str,
+    date: datetime,
+    tokenizer,
+    session,
+    ml_models: dict,
+    feature_columns: list,
+) -> dict:
+    from features import build_feature_vector
 
-                            if pred > 0:
-                                st.metric(label, f"+{pct:.2f}%", delta="Bullish ↑")
-                            else:
-                                st.metric(label, f"{pct:.2f}%", delta="Bearish ↓", delta_color="inverse")
-
-                with st.expander("Raw prediction values"):
-                    results_df = pd.DataFrame([results]).T
-                    results_df.columns = ["Predicted Return"]
-                    results_df["Direction"] = results_df["Predicted Return"].apply(
-                        lambda x: "🟢 Bullish" if x > 0 else "🔴 Bearish"
-                    )
-                    st.dataframe(results_df)
-
-            except Exception as e:
-                st.error(f"Error: {e}")
-                st.exception(e)
+    embedding = embed_speech(text, tokenizer, session)
+    X = build_feature_vector(embedding, date, feature_columns)
+    return {col: model.predict(X)[0] for col, model in ml_models.items()}
