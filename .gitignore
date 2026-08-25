@@ -13,11 +13,6 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# Data (likely large)
-dataset/
-*.csv
-*.npy
-
 # OS
 .DS_Store
 Thumbs.db
