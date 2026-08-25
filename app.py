@@ -13,7 +13,7 @@ from predict import load_models, load_finbert, predict
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Fed Speech Market Reader",
+    page_title="Speech2Market Live Demo",
     page_icon="📊",
     layout="wide",
 )
@@ -177,7 +177,9 @@ st.markdown(
     .bullish { color: var(--bull); }
     .bearish { color: var(--bear); }
 
-    /* ── Context strip (small stat readouts above the charts) ── */
+    /* ── Context strip (small stat readouts above the charts) ──
+       Revamped to a single horizontal row per card: ticker, price,
+       and delta all sit inline (not stacked) to save vertical space. */
     .ctx-strip {
         display: flex;
         gap: 1px;
@@ -187,14 +189,18 @@ st.markdown(
     }
     .ctx-item {
         flex: 1;
-        min-width: 110px;
+        min-width: 170px;
         background: var(--surface-2);
-        padding: 0.4rem 0.75rem;
+        padding: 0.5rem 0.75rem;
         font-family: 'IBM Plex Mono', monospace;
+        display: flex;
+        align-items: baseline;
+        gap: 0.6rem;
+        white-space: nowrap;
     }
-    .ctx-symbol { display: block; font-size: 0.6rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-    .ctx-value { display: block; font-size: 0.92rem; font-weight: 600; color: var(--ink); margin-top: 0.1rem; }
-    .ctx-delta { font-size: 0.68rem; }
+    .ctx-symbol { font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .ctx-value { font-size: 0.92rem; font-weight: 600; color: var(--ink); }
+    .ctx-delta { font-size: 0.7rem; }
 
     div[data-testid="stPlotlyChart"] {
         border: 1px solid var(--line);
@@ -370,7 +376,10 @@ def windowed(df: pd.DataFrame, end_date: date, months: int) -> pd.DataFrame:
 def context_strip_html(items: list) -> str:
     """items: list of (symbol, value_str, delta, delta_str).
     Built as ONE line per div — no leading whitespace — so Streamlit's
-    Markdown parser renders it as HTML instead of a code block."""
+    Markdown parser renders it as HTML instead of a code block.
+    Layout: ticker, value, and delta all sit inline in one row
+    (see .ctx-item flex styling) rather than stacked, to save
+    vertical space."""
     cells = "".join(
         f'<div class="ctx-item"><span class="ctx-symbol">{symbol}</span>'
         f'<span class="ctx-value">{value_str}</span>'
@@ -380,7 +389,7 @@ def context_strip_html(items: list) -> str:
     return f'<div class="ctx-strip">{cells}</div>'
 
 
-def _date_axis(fig, row, col, nticks, tickformat):
+def _date_axis(fig, row, col, nticks, tickformat, rangebreaks=None):
     fig.update_xaxes(
         showgrid=False,
         showticklabels=True,
@@ -390,6 +399,7 @@ def _date_axis(fig, row, col, nticks, tickformat):
         ticks="outside",
         tickcolor=LINE,
         linecolor=LINE,
+        rangebreaks=rangebreaks or [],
         row=row, col=col,
     )
 
@@ -419,7 +429,17 @@ def price_context_figure(df_window: pd.DataFrame) -> go.Figure:
             showgrid=False, zeroline=False, showticklabels=False,
             row=1, col=i,
         )
-        _date_axis(fig, 1, i, nticks=3, tickformat="%b %d")
+        # This is daily trading data, so Sat/Sun have no rows in the
+        # dataframe. Without a rangebreak, Plotly still reserves those
+        # two empty calendar days on the (continuous) date axis, which
+        # throws off the spacing of every tick after the first weekend
+        # gap — a tick label like "Jul 01" ends up positioned over the
+        # nearest *trading* day rather than the actual date it names.
+        # Collapsing weekends out of the axis fixes the alignment.
+        _date_axis(
+            fig, 1, i, nticks=3, tickformat="%b %d",
+            rangebreaks=[dict(bounds=["sat", "mon"])],
+        )
 
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -455,6 +475,9 @@ def macro_context_figure(df_window: pd.DataFrame) -> go.Figure:
             showgrid=False, zeroline=False, showticklabels=False,
             row=1, col=i,
         )
+        # Macro indicators are reported monthly with no weekly gaps,
+        # so no rangebreak is needed here — the tick misalignment was
+        # specific to the daily price series above.
         _date_axis(fig, 1, i, nticks=4, tickformat="%b '%y")
 
     fig.update_layout(
@@ -521,7 +544,7 @@ def render_market_context(speech_date: date):
 
 # ── Ticker tape ──────────────────────────────────────────────────────────
 tape_text = (
-    "FED SPEECH MARKET READER &nbsp; <span>·</span> &nbsp; MACRO RESEARCH DESK &nbsp; "
+    "SPEECH2MARKET LIVE DEMO &nbsp; <span>·</span> &nbsp; MACRO RESEARCH DESK &nbsp; "
     "<span>·</span> &nbsp; MODEL OUTPUT, NOT ADVICE &nbsp; <span>·</span> &nbsp; "
     "S&amp;P 500 &nbsp; GOLD &nbsp; VIX &nbsp; 10Y TREASURY &nbsp; <span>·</span> &nbsp; "
 )
@@ -532,7 +555,7 @@ st.markdown(
 
 # ── Masthead ─────────────────────────────────────────────────────────────
 st.markdown('<div class="eyebrow"><span class="dot"></span>Macro Research Desk</div>', unsafe_allow_html=True)
-st.markdown('<h1 class="hero-title">Fed Speech Market Reader</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="hero-title">Speech2Market Live Demo</h1>', unsafe_allow_html=True)
 st.markdown(
     '<p class="hero-sub">Paste a Fed speech and project directional moves in equities, gold, '
     'volatility, and rates over the next 3, 7, and 30 days.</p>',
@@ -558,9 +581,11 @@ with dc2:
 render_market_context(speech_date)
 
 # ── Speech input ─────────────────────────────────────────────────────────
+# Height bumped up (100 -> 180) now that the more compact, single-row
+# context cards above free up vertical space.
 speech_text = st.text_area(
     "Speech transcript",
-    height=100,
+    height=180,
     placeholder="Paste the Federal Reserve speech text here…",
     label_visibility="collapsed",
 )
