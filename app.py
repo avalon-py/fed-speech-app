@@ -61,7 +61,12 @@ st.markdown(
 
     .stApp, .stApp p, .stApp label, .stApp span { font-family: 'Inter', sans-serif; }
     [data-testid="stHeader"] { background: transparent; height: 2.2rem; }
-    .block-container { padding-top: 0.3rem !important; padding-bottom: 0.6rem !important; }
+    .block-container { padding-top: 0.25rem !important; padding-bottom: 0.35rem !important; }
+
+    /* Streamlit spaces every element in a vertical block with a flex
+       gap — that default (~1rem) was the main thing pushing content
+       below the fold. Tighten it globally. */
+    [data-testid="stVerticalBlock"] { gap: 0.3rem !important; }
 
     [data-testid="stAppViewContainer"] {
         background-image: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px);
@@ -88,18 +93,18 @@ st.markdown(
     .hero-title {
         font-family: 'Fraunces', serif;
         font-weight: 600;
-        font-size: 1.55rem;
+        font-size: 1.4rem;
         line-height: 1.05;
         color: var(--ink);
-        margin: 0 0 0.15rem 0;
+        margin: 0;
         letter-spacing: -0.01em;
         display: inline-block;
     }
     .hero-sub {
         color: var(--muted);
-        font-size: 0.78rem;
-        line-height: 1.4;
-        margin: 0 0 0.4rem 0;
+        font-size: 0.76rem;
+        line-height: 1.3;
+        margin: 0 0 0.15rem 0;
     }
     .section-label {
         font-family: 'IBM Plex Mono', monospace;
@@ -108,8 +113,8 @@ st.markdown(
         text-transform: uppercase;
         color: var(--gold);
         border-top: 1px solid var(--line);
-        padding-top: 0.35rem;
-        margin: 0.6rem 0 0.4rem 0;
+        padding-top: 0.2rem;
+        margin: 0.2rem 0 0.15rem 0;
         display: flex;
         justify-content: space-between;
         gap: 1rem;
@@ -161,7 +166,7 @@ st.markdown(
         flex: 1;
         min-width: 170px;
         background: var(--surface-2);
-        padding: 0.5rem 0.75rem;
+        padding: 0.3rem 0.75rem;
         font-family: 'IBM Plex Mono', monospace;
         display: flex;
         align-items: baseline;
@@ -415,7 +420,7 @@ def price_context_figure(df_window: pd.DataFrame) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=SURFACE,
         showlegend=False,
-        height=125,
+        height=140,
         margin=dict(l=0, r=0, t=6, b=4),
         hoverlabel=dict(bgcolor=SURFACE2, font_family=MONO, font_color=INK, bordercolor=LINE),
     )
