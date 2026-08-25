@@ -21,16 +21,17 @@ def get_models():
 
 @st.cache_resource
 def get_finbert():
-    return load_finbert()
+    # Returns (tokenizer, onnxruntime.InferenceSession) - both loaded
+    # from models/finbert-onnx/ on disk, no network call.
+    return load_finbert("models/finbert-onnx")
 
 @st.cache_data
 def get_feature_columns():
     return joblib.load("models/feature_columns.pkl")
 
 ml_models       = get_models()
-tokenizer       = get_finbert()
+tokenizer, finbert_session = get_finbert()
 feature_columns = get_feature_columns()
-hf_token        = st.secrets["HF_TOKEN"]
 
 # ── UI ─────────────────────────────────────────────────────────────────────
 st.title("🏦 Fed Speech Market Impact Analyzer")
@@ -62,7 +63,7 @@ with col2:
     st.caption(f"Using date: **{speech_date}**")
     st.divider()
     st.markdown("**How it works**")
-    st.caption("1. Speech → FinBERT embedding via HuggingFace API")
+    st.caption("1. Speech → FinBERT embedding (local FP16 ONNX, CPU)")
     st.caption("2. Price history read from dataset/price_action.csv (synced daily via cron)")
     st.caption("3. Macro data read from dataset/macro_indicators.csv (synced daily via cron)")
     st.caption("4. Run through trained models")
@@ -75,13 +76,13 @@ if run:
     if not speech_text.strip():
         st.error("Please enter a speech.")
     else:
-        with st.spinner("Reading market data and running predictions..."):
+        with st.spinner("Embedding speech and running predictions..."):
             try:
                 results = predict(
                     text=speech_text,
                     date=datetime.combine(speech_date, datetime.min.time()),
                     tokenizer=tokenizer,
-                    hf_token=hf_token,
+                    session=finbert_session,
                     ml_models=ml_models,
                     feature_columns=feature_columns,
                 )
