@@ -12,20 +12,22 @@ TARGET_COLS = [
     "TNX_t+3",  "TNX_t+7",  "TNX_t+30",
 ]
 
+
 def load_models(models_dir: str = "models") -> dict:
     return {
         col: joblib.load(os.path.join(models_dir, f"{col}.pkl"))
         for col in TARGET_COLS
     }
 
+
 def load_finbert():
     tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
     return tokenizer
 
+
 def embed_speech(text: str, tokenizer, hf_token: str) -> np.ndarray:
     API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/ProsusAI/finbert"
     headers = {"Authorization": f"Bearer {hf_token}"}
-
     tokens = tokenizer(
         text,
         return_tensors="pt",
@@ -35,7 +37,6 @@ def embed_speech(text: str, tokenizer, hf_token: str) -> np.ndarray:
         return_overflowing_tokens=True,
         padding=True
     )
-
     cls_embeddings = []
     for i in range(tokens["input_ids"].shape[0]):
         chunk_text = tokenizer.decode(tokens["input_ids"][i], skip_special_tokens=True)
@@ -45,8 +46,8 @@ def embed_speech(text: str, tokenizer, hf_token: str) -> np.ndarray:
         }, timeout=30)
         resp.raise_for_status()
         cls_embeddings.append(np.array(resp.json()[0][0]))
-
     return np.mean(cls_embeddings, axis=0)
+
 
 def predict(
     text: str,
@@ -55,9 +56,12 @@ def predict(
     hf_token: str,
     ml_models: dict,
     feature_columns: list,
-    fred_api_key: str
 ) -> dict:
     from features import build_feature_vector
+
     embedding = embed_speech(text, tokenizer, hf_token)
-    X = build_feature_vector(embedding, date, fred_api_key, feature_columns)
+    # price/macro features now come from dataset/price_action.csv and
+    # dataset/macro_indicators.csv (synced daily by the cron job), so no
+    # FRED api key is needed here anymore.
+    X = build_feature_vector(embedding, date, feature_columns)
     return {col: model.predict(X)[0] for col, model in ml_models.items()}
