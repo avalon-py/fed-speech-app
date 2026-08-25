@@ -1,0 +1,23 @@
+name: Keep Streamlit Alive
+
+on:
+  schedule:
+    # Runs at the start of every hour
+    - cron: '0 * * * *'
+  # Allows you to manually trigger the ping from GitHub
+  workflow_dispatch:
+
+jobs:
+  ping-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run ping script
+        run: python ping.py
