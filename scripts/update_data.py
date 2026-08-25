@@ -176,7 +176,7 @@ def fetch_prices(today: pd.Timestamp, last_date: pd.Timestamp | None) -> pd.Data
             fail(f"yfinance returned no data for {name} ({ticker})")
         data[name] = df["Close"]
 
-    prices = pd.concat(data, axis=1)
+    prices = pd.concat(data, axis=1, sort=True)  # explicit, silences Pandas4Warning
     prices.columns = TICKERS.keys()
     prices["TNX"] = prices["TNX"] / 10
     prices = prices.sort_index()
