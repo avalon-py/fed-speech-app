@@ -5,6 +5,9 @@ on:
     - cron: '0 3 * * *'   # 03:00 UTC daily — a few hours after US market close, buffer for data finalization
   workflow_dispatch:        # lets you trigger it manually too, useful for testing
 
+permissions:
+  contents: write  # GITHUB_TOKEN needs write access to push the updated CSVs back
+
 jobs:
   update-data:
     runs-on: ubuntu-latest
