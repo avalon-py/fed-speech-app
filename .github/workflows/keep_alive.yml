@@ -2,9 +2,7 @@ name: Keep Streamlit Alive
 
 on:
   schedule:
-    # Runs at the start of every hour
-    - cron: '0 * * * *'
-  # Allows you to manually trigger the ping from GitHub
+    - cron: '0 * * * *'  # Runs every hour
   workflow_dispatch:
 
 jobs:
@@ -19,6 +17,8 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Run ping script
-        # Updated path to point to the scripts folder
+      - name: Install Selenium
+        run: pip install selenium
+
+      - name: Run wake up script
         run: python scripts/ping.py
