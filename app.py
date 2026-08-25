@@ -2,8 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-from datetime import datetime, date
 import os
+from datetime import datetime, date
+from dateutil.relativedelta import relativedelta
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from predict import load_models, load_finbert, predict
 
@@ -14,16 +18,36 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Color tokens (kept in sync with the CSS custom properties below,
+#    since Plotly can't read CSS vars) ──────────────────────────────────────
+INK      = "#E7E4DA"
+MUTED    = "#8B92A0"
+SURFACE  = "#141920"
+SURFACE2 = "#10141A"
+LINE     = "rgba(255,255,255,0.08)"
+GOLD     = "#C9A227"
+BULL     = "#4E9A6B"
+BEAR     = "#B84C3E"
+MONO     = "IBM Plex Mono, monospace"
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 # ── Design tokens + chrome ──────────────────────────────────────────────────
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
     :root {
         --ink:        #E7E4DA;
         --muted:      #8B92A0;
         --surface:    #141920;
+        --surface-2:  #10141A;
         --line:       rgba(255,255,255,0.08);
         --gold:       #C9A227;
         --bull:       #4E9A6B;
@@ -33,67 +57,91 @@ st.markdown(
     .stApp, .stApp p, .stApp label, .stApp span { font-family: 'Inter', sans-serif; }
     [data-testid="stHeader"] { background: transparent; }
 
+    /* faint dot-grid texture on the page, terminal-glass feel */
+    [data-testid="stAppViewContainer"] {
+        background-image: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px);
+        background-size: 22px 22px;
+    }
+
+    /* ── Marquee ticker tape (signature element) ── */
+    .tape-wrap {
+        overflow: hidden;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface-2);
+        white-space: nowrap;
+        margin: -1rem -1rem 1.75rem -1rem;
+        padding: 0;
+    }
+    .tape-track {
+        display: inline-block;
+        padding-left: 100%;
+        animation: tape-scroll 42s linear infinite;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.68rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted);
+        padding-top: 0.45rem;
+        padding-bottom: 0.45rem;
+    }
+    .tape-track span { color: var(--gold); }
+    @keyframes tape-scroll {
+        0%   { transform: translateX(0); }
+        100% { transform: translateX(-100%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .tape-track { animation: none; padding-left: 1rem; }
+    }
+
     /* ── Masthead ── */
     .eyebrow {
         font-family: 'IBM Plex Mono', monospace;
         font-size: 0.72rem;
-        letter-spacing: 0.14em;
+        letter-spacing: 0.16em;
         text-transform: uppercase;
         color: var(--gold);
         margin-bottom: 0.6rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .eyebrow .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: var(--bull);
+        box-shadow: 0 0 0 3px rgba(78,154,107,0.18);
     }
     .hero-title {
         font-family: 'Fraunces', serif;
         font-weight: 600;
-        font-size: 2.5rem;
-        line-height: 1.08;
+        font-size: 2.75rem;
+        line-height: 1.05;
         color: var(--ink);
-        margin: 0 0 0.6rem 0;
+        margin: 0 0 0.7rem 0;
+        letter-spacing: -0.01em;
     }
     .hero-sub {
         color: var(--muted);
-        font-size: 0.95rem;
-        max-width: 620px;
-        line-height: 1.5;
+        font-size: 0.96rem;
+        max-width: 640px;
+        line-height: 1.55;
         margin-bottom: 0.25rem;
     }
-
-    /* ── Dispatch panel (right column) ── */
-    .dispatch-box {
-        background: var(--surface);
-        border: 1px solid var(--line);
-        border-left: 2px solid var(--gold);
-        padding: 1rem 1.25rem;
+    .section-label {
         font-family: 'IBM Plex Mono', monospace;
-    }
-    .dispatch-label {
-        color: var(--gold);
-        letter-spacing: 0.1em;
+        font-size: 0.68rem;
+        letter-spacing: 0.14em;
         text-transform: uppercase;
-        font-size: 0.65rem;
-        margin-bottom: 0.5rem;
-    }
-    .dispatch-row {
+        color: var(--gold);
+        border-top: 1px solid var(--line);
+        padding-top: 0.6rem;
+        margin: 2rem 0 0.9rem 0;
         display: flex;
         justify-content: space-between;
-        font-size: 0.78rem;
-        color: var(--muted);
-        padding: 0.3rem 0;
-        border-bottom: 1px solid var(--line);
+        gap: 1rem;
     }
-    .dispatch-row:last-child { border-bottom: none; }
-    .dispatch-row b { color: var(--ink); font-weight: 500; }
+    .section-label .coverage { color: var(--muted); text-transform: none; letter-spacing: 0; }
 
-    .steps {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.78rem;
-        color: var(--muted);
-        margin-top: 1.1rem;
-    }
-    .steps .step { display: flex; gap: 0.6rem; padding: 0.25rem 0; }
-    .steps .step-n { color: var(--gold); }
-
-    /* ── Ticker strip (signature element) ── */
+    /* ── Ticker strip (results, headline read) ── */
     .ticker-strip {
         display: flex;
         gap: 1px;
@@ -108,7 +156,9 @@ st.markdown(
         background: var(--surface);
         padding: 0.9rem 1.1rem;
         font-family: 'IBM Plex Mono', monospace;
+        transition: background 0.15s ease, transform 0.15s ease;
     }
+    .ticker-item:hover { background: var(--surface-2); transform: translateY(-1px); }
     .ticker-symbol {
         display: block;
         font-size: 0.68rem;
@@ -121,6 +171,32 @@ st.markdown(
     .ticker-horizon { font-size: 0.65rem; color: var(--muted); }
     .bullish { color: var(--bull); }
     .bearish { color: var(--bear); }
+
+    /* ── Context strip (small stat readouts above the charts) ── */
+    .ctx-strip {
+        display: flex;
+        gap: 1px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-bottom: none;
+    }
+    .ctx-item {
+        flex: 1;
+        min-width: 120px;
+        background: var(--surface-2);
+        padding: 0.65rem 0.9rem;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .ctx-symbol { display: block; font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .ctx-value { display: block; font-size: 1.02rem; font-weight: 600; color: var(--ink); margin-top: 0.15rem; }
+    .ctx-delta { font-size: 0.72rem; }
+
+    /* tuck the plotly chart directly under the context strip, same border */
+    div[data-testid="stPlotlyChart"] {
+        border: 1px solid var(--line);
+        border-top: none;
+        background: var(--surface);
+    }
 
     /* ── Blotter table ── */
     table.blotter {
@@ -148,6 +224,44 @@ st.markdown(
         font-family: 'Inter', sans-serif;
         color: var(--ink);
         font-weight: 500;
+    }
+
+    /* ── Form controls, restyled to match the terminal register ── */
+    .stTextArea textarea {
+        background: var(--surface) !important;
+        border: 1px solid var(--line) !important;
+        color: var(--ink) !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-size: 0.85rem !important;
+    }
+    .stTextArea textarea:focus { border-color: var(--gold) !important; box-shadow: none !important; }
+    .stCheckbox label, .stDateInput label { font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .stDateInput input {
+        background: var(--surface) !important;
+        border: 1px solid var(--line) !important;
+        color: var(--ink) !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+    }
+
+    div.stButton > button {
+        background: transparent;
+        border: 1px solid var(--gold);
+        color: var(--gold);
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.78rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        border-radius: 0;
+        padding: 0.7rem 1rem;
+        transition: background 0.15s ease, color 0.15s ease;
+    }
+    div.stButton > button:hover {
+        background: var(--gold);
+        color: #0B0E13;
+        border-color: var(--gold);
+    }
+    div.stButton > button:focus:not(:active) {
+        color: var(--gold);
     }
 
     .disclaimer {
@@ -181,6 +295,20 @@ def get_feature_columns():
 
 
 @st.cache_data
+def load_price_data() -> pd.DataFrame:
+    df = pd.read_csv(os.path.join("dataset", "price_action.csv"))
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date")
+
+
+@st.cache_data
+def load_macro_data() -> pd.DataFrame:
+    df = pd.read_csv(os.path.join("dataset", "macro_indicators.csv"))
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date")
+
+
+@st.cache_data
 def get_date_bounds():
     """
     Derives the selectable date range from what the CSVs actually cover.
@@ -188,11 +316,8 @@ def get_date_bounds():
     macro history to build a full feature vector); latest = the earlier of
     the two end dates, capped at today.
     """
-    price = pd.read_csv(os.path.join("dataset", "price_action.csv"))
-    macro = pd.read_csv(os.path.join("dataset", "macro_indicators.csv"))
-
-    price_dates = pd.to_datetime(price["date"])
-    macro_dates = pd.to_datetime(macro["date"])
+    price_dates = load_price_data()["date"]
+    macro_dates = load_macro_data()["date"]
 
     earliest = max(price_dates.min(), macro_dates.min())
     latest = min(price_dates.max(), macro_dates.max())
@@ -213,6 +338,12 @@ ASSETS = {
 }
 HORIZONS = ["t+3", "t+7", "t+30"]
 
+MACRO_SERIES = {
+    "unemployment": {"label": "Unemployment", "unit": "%"},
+    "interest_rate": {"label": "Fed Funds Rate", "unit": "%"},
+    "growth_rate": {"label": "GDP Growth", "unit": "%"},
+}
+
 
 def direction_class(v: float) -> str:
     return "bullish" if v > 0 else "bearish"
@@ -227,8 +358,161 @@ def fmt_pct(v: float) -> str:
     return f"{sign}{v * 100:.2f}%"
 
 
+# ── Market context chart builders ───────────────────────────────────────────
+def windowed(df: pd.DataFrame, end_date: date, months: int = 3) -> pd.DataFrame:
+    end_ts = pd.Timestamp(end_date)
+    start_ts = end_ts - relativedelta(months=months)
+    return df[(df["date"] >= start_ts) & (df["date"] <= end_ts)]
+
+
+def context_strip_html(items: list) -> str:
+    """items: list of (symbol, value_str, delta, delta_str)"""
+    cells = ""
+    for symbol, value_str, delta, delta_str in items:
+        cls = "bullish" if delta >= 0 else "bearish"
+        cells += f"""
+        <div class="ctx-item">
+            <span class="ctx-symbol">{symbol}</span>
+            <span class="ctx-value">{value_str}</span>
+            <span class="ctx-delta {cls}">{arrow(delta)} {delta_str}</span>
+        </div>
+        """
+    return f'<div class="ctx-strip">{cells}</div>'
+
+
+def price_context_figure(df_window: pd.DataFrame) -> go.Figure:
+    symbols = [meta["symbol"] for meta in ASSETS.values()]
+    fig = make_subplots(rows=1, cols=len(symbols), horizontal_spacing=0.03)
+
+    for i, symbol in enumerate(symbols, start=1):
+        series = df_window[symbol].astype(float)
+        up = series.iloc[-1] >= series.iloc[0] if len(series) > 1 else True
+        color = BULL if up else BEAR
+        fig.add_trace(
+            go.Scatter(
+                x=df_window["date"], y=series,
+                mode="lines",
+                line=dict(color=color, width=1.6),
+                fill="tozeroy",
+                fillcolor=_rgba(color, 0.10),
+                hovertemplate=f"{symbol} · %{{x|%b %d, %Y}}<br>%{{y:,.2f}}<extra></extra>",
+            ),
+            row=1, col=i,
+        )
+        pad = (series.max() - series.min()) * 0.18 or series.mean() * 0.02 or 1
+        fig.update_yaxes(
+            range=[series.min() - pad, series.max() + pad],
+            showgrid=False, zeroline=False, showticklabels=False,
+            row=1, col=i,
+        )
+        fig.update_xaxes(
+            showgrid=False, showticklabels=False, row=1, col=i,
+        )
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=SURFACE,
+        showlegend=False,
+        height=110,
+        margin=dict(l=0, r=0, t=6, b=6),
+        hoverlabel=dict(bgcolor=SURFACE2, font_family=MONO, font_color=INK, bordercolor=LINE),
+    )
+    return fig
+
+
+def macro_context_figure(df_window: pd.DataFrame) -> go.Figure:
+    keys = list(MACRO_SERIES.keys())
+    fig = make_subplots(rows=1, cols=len(keys), horizontal_spacing=0.03)
+
+    for i, key in enumerate(keys, start=1):
+        series = df_window[key].astype(float)
+        fig.add_trace(
+            go.Scatter(
+                x=df_window["date"], y=series,
+                mode="lines",
+                line=dict(color=GOLD, width=1.6, shape="hv"),
+                fill="tozeroy",
+                fillcolor=_rgba(GOLD, 0.08),
+                hovertemplate=f"{MACRO_SERIES[key]['label']} · %{{x|%b %d, %Y}}<br>%{{y:.2f}}%<extra></extra>",
+            ),
+            row=1, col=i,
+        )
+        pad = (series.max() - series.min()) * 0.25 or 0.1
+        fig.update_yaxes(
+            range=[series.min() - pad, series.max() + pad],
+            showgrid=False, zeroline=False, showticklabels=False,
+            row=1, col=i,
+        )
+        fig.update_xaxes(showgrid=False, showticklabels=False, row=1, col=i)
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=SURFACE,
+        showlegend=False,
+        height=100,
+        margin=dict(l=0, r=0, t=6, b=6),
+        hoverlabel=dict(bgcolor=SURFACE2, font_family=MONO, font_color=INK, bordercolor=LINE),
+    )
+    return fig
+
+
+def render_market_context(speech_date: date):
+    price_df = load_price_data()
+    macro_df = load_macro_data()
+
+    price_win = windowed(price_df, speech_date)
+    macro_win = windowed(macro_df, speech_date)
+
+    window_start = (pd.Timestamp(speech_date) - relativedelta(months=3)).date()
+
+    st.markdown(
+        f'<div class="section-label"><span>Market Context · Trailing 3 Months</span>'
+        f'<span class="coverage">{window_start} → {speech_date} · full history {min_date} → {max_date}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if price_win.empty or macro_win.empty:
+        st.info("No data in the trailing 3-month window for this date.")
+        return
+
+    # Price / vol assets
+    price_items = []
+    for meta in ASSETS.values():
+        series = price_win[meta["symbol"]].astype(float)
+        first, last = series.iloc[0], series.iloc[-1]
+        delta = (last - first) / first if first else 0.0
+        price_items.append((meta["symbol"], f"{last:,.2f}", delta, fmt_pct(delta)))
+
+    st.markdown(context_strip_html(price_items), unsafe_allow_html=True)
+    st.plotly_chart(price_context_figure(price_win), use_container_width=True, config={"displayModeBar": False})
+
+    st.write("")
+
+    # Macro indicators
+    macro_items = []
+    for key, meta in MACRO_SERIES.items():
+        series = macro_win[key].astype(float)
+        first, last = series.iloc[0], series.iloc[-1]
+        delta_pp = last - first
+        macro_items.append((meta["label"], f"{last:.2f}{meta['unit']}", delta_pp, f"{delta_pp:+.2f}pp"))
+
+    st.markdown(context_strip_html(macro_items), unsafe_allow_html=True)
+    st.plotly_chart(macro_context_figure(macro_win), use_container_width=True, config={"displayModeBar": False})
+
+
+# ── Ticker tape ──────────────────────────────────────────────────────────
+tape_text = (
+    "FED SPEECH MARKET READER &nbsp; <span>·</span> &nbsp; MACRO RESEARCH DESK &nbsp; "
+    "<span>·</span> &nbsp; MODEL OUTPUT, NOT ADVICE &nbsp; <span>·</span> &nbsp; "
+    "S&amp;P 500 &nbsp; GOLD &nbsp; VIX &nbsp; 10Y TREASURY &nbsp; <span>·</span> &nbsp; "
+)
+st.markdown(
+    f'<div class="tape-wrap"><div class="tape-track">{tape_text * 3}</div></div>',
+    unsafe_allow_html=True,
+)
+
 # ── Masthead ─────────────────────────────────────────────────────────────
-st.markdown('<div class="eyebrow">Macro Research Desk · Model Output, Not Advice</div>', unsafe_allow_html=True)
+st.markdown('<div class="eyebrow"><span class="dot"></span>Macro Research Desk</div>', unsafe_allow_html=True)
 st.markdown('<h1 class="hero-title">Fed Speech Market Reader</h1>', unsafe_allow_html=True)
 st.markdown(
     '<p class="hero-sub">Paste a Federal Reserve speech and the model reads it against '
@@ -261,23 +545,8 @@ with col2:
             max_value=max_date,
         )
 
-    st.markdown(
-        f"""
-        <div class="dispatch-box">
-            <div class="dispatch-label">Dispatch details</div>
-            <div class="dispatch-row"><span>Speech date</span><b>{speech_date}</b></div>
-            <div class="dispatch-row"><span>Data from</span><b>{min_date}</b></div>
-            <div class="dispatch-row"><span>Data to</span><b>{max_date}</b></div>
-        </div>
-        <div class="steps">
-            <div class="step"><span class="step-n">01</span><span>Speech → FinBERT embedding, local FP16 ONNX</span></div>
-            <div class="step"><span class="step-n">02</span><span>Price history read from dataset/price_action.csv</span></div>
-            <div class="step"><span class="step-n">03</span><span>Macro data read from dataset/macro_indicators.csv</span></div>
-            <div class="step"><span class="step-n">04</span><span>Feature vector run through trained models</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# ── Market context (reacts live to the date controls above) ────────────────
+render_market_context(speech_date)
 
 st.write("")
 run = st.button("Run model", type="primary", use_container_width=True)
@@ -300,6 +569,11 @@ if run:
                     session=finbert_session,
                     ml_models=ml_models,
                     feature_columns=feature_columns,
+                )
+
+                st.markdown(
+                    '<div class="section-label"><span>Prediction · Headline Read (t+3)</span></div>',
+                    unsafe_allow_html=True,
                 )
 
                 # ── Ticker strip: headline (t+3) read per asset ──
