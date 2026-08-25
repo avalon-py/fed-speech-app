@@ -20,4 +20,5 @@ jobs:
           python-version: '3.x'
 
       - name: Run ping script
-        run: python ping.py
+        # Updated path to point to the scripts folder
+        run: python scripts/ping.py
