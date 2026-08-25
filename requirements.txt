@@ -1,10 +1,16 @@
 streamlit
-yfinance
-pandas
-numpy
 scikit-learn
 torch --index-url https://download.pytorch.org/whl/cpu
 transformers
 joblib
 requests
-fredapi
+
+# Pinned to the exact versions confirmed working end-to-end in the
+# 2026-08-25 workflow run. Bump these deliberately (test locally first),
+# never let them drift silently — an unpinned `pip install` here means
+# the data pipeline runs on a different, unvetted library version every
+# single day with no warning if something upstream changes behavior.
+pandas==3.0.5
+numpy==2.4.6
+fredapi==0.5.2
+yfinance==1.6.0
