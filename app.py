@@ -29,9 +29,34 @@ def get_finbert():
 def get_feature_columns():
     return joblib.load("models/feature_columns.pkl")
 
+@st.cache_data
+def get_date_bounds():
+    """
+    Derives the selectable date range from what the CSVs actually cover,
+    instead of relying on st.date_input's implicit default (10 years
+    before `value` when min_value is omitted - that's what was producing
+    the 2016/08/25 floor, not a real data-coverage check).
+
+    earliest = the later of the two CSVs' start dates, since a date needs
+    BOTH price and macro history available to build a full feature vector.
+    latest   = the earlier of the two CSVs' end dates, same reasoning,
+               capped at today since the app doesn't take future dates.
+    """
+    price = pd.read_csv(os.path.join("dataset", "price_action.csv"))
+    macro = pd.read_csv(os.path.join("dataset", "macro_indicators.csv"))
+
+    price_dates = pd.to_datetime(price["date"])
+    macro_dates = pd.to_datetime(macro["date"])
+
+    earliest = max(price_dates.min(), macro_dates.min())
+    latest = min(price_dates.max(), macro_dates.max())
+
+    return earliest.date(), min(latest.date(), date.today())
+
 ml_models       = get_models()
 tokenizer, finbert_session = get_finbert()
 feature_columns = get_feature_columns()
+min_date, max_date = get_date_bounds()
 
 # ── UI ─────────────────────────────────────────────────────────────────────
 st.title("🏦 Fed Speech Market Impact Analyzer")
@@ -56,11 +81,13 @@ with col2:
     if not use_today:
         speech_date = st.date_input(
             "Select date",
-            value=date.today(),
-            max_value=date.today()
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
         )
 
     st.caption(f"Using date: **{speech_date}**")
+    st.caption(f"Data available from **{min_date}** to **{max_date}**")
     st.divider()
     st.markdown("**How it works**")
     st.caption("1. Speech → FinBERT embedding (local FP16 ONNX, CPU)")
@@ -75,6 +102,11 @@ run = st.button("🔍 Analyze Speech", type="primary", use_container_width=True)
 if run:
     if not speech_text.strip():
         st.error("Please enter a speech.")
+    elif not (min_date <= speech_date <= max_date):
+        st.error(
+            f"Selected date {speech_date} is outside available data coverage "
+            f"({min_date} to {max_date})."
+        )
     else:
         with st.spinner("Embedding speech and running predictions..."):
             try:
