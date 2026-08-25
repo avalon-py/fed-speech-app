@@ -61,41 +61,11 @@ st.markdown(
 
     .stApp, .stApp p, .stApp label, .stApp span { font-family: 'Inter', sans-serif; }
     [data-testid="stHeader"] { background: transparent; height: 2.2rem; }
-    .block-container { padding-top: 0.6rem !important; padding-bottom: 0.6rem !important; }
+    .block-container { padding-top: 0.3rem !important; padding-bottom: 0.6rem !important; }
 
     [data-testid="stAppViewContainer"] {
         background-image: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px);
         background-size: 22px 22px;
-    }
-
-    /* ── Marquee ticker tape ── */
-    .tape-wrap {
-        overflow: hidden;
-        border-bottom: 1px solid var(--line);
-        background: var(--surface-2);
-        white-space: nowrap;
-        margin: -0.6rem -1rem 0.6rem -1rem;
-        padding: 0;
-    }
-    .tape-track {
-        display: inline-block;
-        padding-left: 100%;
-        animation: tape-scroll 42s linear infinite;
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.62rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: var(--muted);
-        padding-top: 0.25rem;
-        padding-bottom: 0.25rem;
-    }
-    .tape-track span { color: var(--gold); }
-    @keyframes tape-scroll {
-        0%   { transform: translateX(0); }
-        100% { transform: translateX(-100%); }
-    }
-    @media (prefers-reduced-motion: reduce) {
-        .tape-track { animation: none; padding-left: 1rem; }
     }
 
     /* ── Masthead ── */
@@ -541,17 +511,6 @@ def render_market_context(speech_date: date):
         st.markdown(context_strip_html(macro_items), unsafe_allow_html=True)
         st.plotly_chart(macro_context_figure(macro_win), use_container_width=True, config={"displayModeBar": False})
 
-
-# ── Ticker tape ──────────────────────────────────────────────────────────
-tape_text = (
-    "SPEECH2MARKET LIVE DEMO &nbsp; <span>·</span> &nbsp; MACRO RESEARCH DESK &nbsp; "
-    "<span>·</span> &nbsp; MODEL OUTPUT, NOT ADVICE &nbsp; <span>·</span> &nbsp; "
-    "S&amp;P 500 &nbsp; GOLD &nbsp; VIX &nbsp; 10Y TREASURY &nbsp; <span>·</span> &nbsp; "
-)
-st.markdown(
-    f'<div class="tape-wrap"><div class="tape-track">{tape_text * 3}</div></div>',
-    unsafe_allow_html=True,
-)
 
 # ── Masthead ─────────────────────────────────────────────────────────────
 st.markdown('<div class="eyebrow"><span class="dot"></span>Macro Research Desk</div>', unsafe_allow_html=True)
