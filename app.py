@@ -30,7 +30,6 @@ def get_feature_columns():
 ml_models       = get_models()
 tokenizer       = get_finbert()
 feature_columns = get_feature_columns()
-fred_api_key    = st.secrets["FRED_API_KEY"]
 hf_token        = st.secrets["HF_TOKEN"]
 
 # ── UI ─────────────────────────────────────────────────────────────────────
@@ -64,8 +63,8 @@ with col2:
     st.divider()
     st.markdown("**How it works**")
     st.caption("1. Speech → FinBERT embedding via HuggingFace API")
-    st.caption("2. Fetch price history from Yahoo Finance")
-    st.caption("3. Fetch macro data from FRED")
+    st.caption("2. Price history read from dataset/price_action.csv (synced daily via cron)")
+    st.caption("3. Macro data read from dataset/macro_indicators.csv (synced daily via cron)")
     st.caption("4. Run through trained models")
 
 st.divider()
@@ -76,16 +75,15 @@ if run:
     if not speech_text.strip():
         st.error("Please enter a speech.")
     else:
-        with st.spinner("Fetching market data and running predictions..."):
+        with st.spinner("Reading market data and running predictions..."):
             try:
                 results = predict(
                     text=speech_text,
                     date=datetime.combine(speech_date, datetime.min.time()),
                     tokenizer=tokenizer,
-                    hf_token=hf_token,      # ← fixed: was bert_model
+                    hf_token=hf_token,
                     ml_models=ml_models,
                     feature_columns=feature_columns,
-                    fred_api_key=fred_api_key
                 )
 
                 st.success("Prediction complete!")
