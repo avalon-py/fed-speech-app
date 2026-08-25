@@ -195,7 +195,6 @@ st.markdown(
     .ctx-symbol { display: block; font-size: 0.6rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
     .ctx-value { display: block; font-size: 0.92rem; font-weight: 600; color: var(--ink); margin-top: 0.1rem; }
     .ctx-delta { font-size: 0.68rem; }
-    .ctx-sep { border-left: 1px solid var(--gold); }
 
     div[data-testid="stPlotlyChart"] {
         border: 1px solid var(--line);
@@ -368,16 +367,15 @@ def windowed(df: pd.DataFrame, end_date: date, months: int) -> pd.DataFrame:
     return df[(df["date"] >= start_ts) & (df["date"] <= end_ts)]
 
 
-def context_strip_html(items: list, sep_index: int | None = None) -> str:
+def context_strip_html(items: list) -> str:
     """items: list of (symbol, value_str, delta, delta_str).
     Built as ONE line per div — no leading whitespace — so Streamlit's
-    Markdown parser renders it as HTML instead of a code block.
-    sep_index: if set, that item gets a left border to mark a group boundary."""
+    Markdown parser renders it as HTML instead of a code block."""
     cells = "".join(
-        f'<div class="ctx-item{" ctx-sep" if idx == sep_index else ""}"><span class="ctx-symbol">{symbol}</span>'
+        f'<div class="ctx-item"><span class="ctx-symbol">{symbol}</span>'
         f'<span class="ctx-value">{value_str}</span>'
         f'<span class="ctx-delta {"bullish" if delta >= 0 else "bearish"}">{arrow(delta)} {delta_str}</span></div>'
-        for idx, (symbol, value_str, delta, delta_str) in enumerate(items)
+        for symbol, value_str, delta, delta_str in items
     )
     return f'<div class="ctx-strip">{cells}</div>'
 
@@ -396,25 +394,17 @@ def _date_axis(fig, row, col, nticks, tickformat):
     )
 
 
-def combined_context_figure(price_win: pd.DataFrame, macro_win: pd.DataFrame) -> go.Figure:
-    """One row: price/vol assets (3mo window) followed by macro indicators
-    (1yr window), with a vertical divider marking the group boundary."""
-    price_symbols = [meta["symbol"] for meta in ASSETS.values()]
-    macro_keys = list(MACRO_SERIES.keys())
-    n_price, n_macro = len(price_symbols), len(macro_keys)
-    n_cols = n_price + n_macro
-    spacing = 0.035
+def price_context_figure(df_window: pd.DataFrame) -> go.Figure:
+    symbols = [meta["symbol"] for meta in ASSETS.values()]
+    fig = make_subplots(rows=1, cols=len(symbols), horizontal_spacing=0.04)
 
-    fig = make_subplots(rows=1, cols=n_cols, horizontal_spacing=spacing)
-
-    # price/vol columns
-    for i, symbol in enumerate(price_symbols, start=1):
-        series = price_win[symbol].astype(float)
+    for i, symbol in enumerate(symbols, start=1):
+        series = df_window[symbol].astype(float)
         up = series.iloc[-1] >= series.iloc[0] if len(series) > 1 else True
         color = BULL if up else BEAR
         fig.add_trace(
             go.Scatter(
-                x=price_win["date"], y=series,
+                x=df_window["date"], y=series,
                 mode="lines",
                 line=dict(color=color, width=1.6),
                 fill="tozeroy",
@@ -431,29 +421,6 @@ def combined_context_figure(price_win: pd.DataFrame, macro_win: pd.DataFrame) ->
         )
         _date_axis(fig, 1, i, nticks=3, tickformat="%b %d")
 
-    # macro columns
-    for j, key in enumerate(macro_keys, start=1):
-        col = n_price + j
-        series = macro_win[key].astype(float)
-        fig.add_trace(
-            go.Scatter(
-                x=macro_win["date"], y=series,
-                mode="lines",
-                line=dict(color=GOLD, width=1.6, shape="hv"),
-                fill="tozeroy",
-                fillcolor=_rgba(GOLD, 0.08),
-                hovertemplate=f"{MACRO_SERIES[key]['label']} · %{{x|%b %Y}}<br>%{{y:.2f}}%<extra></extra>",
-            ),
-            row=1, col=col,
-        )
-        pad = (series.max() - series.min()) * 0.25 or 0.1
-        fig.update_yaxes(
-            range=[series.min() - pad, series.max() + pad],
-            showgrid=False, zeroline=False, showticklabels=False,
-            row=1, col=col,
-        )
-        _date_axis(fig, 1, col, nticks=4, tickformat="%b '%y")
-
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=SURFACE,
@@ -462,22 +429,42 @@ def combined_context_figure(price_win: pd.DataFrame, macro_win: pd.DataFrame) ->
         margin=dict(l=0, r=0, t=6, b=4),
         hoverlabel=dict(bgcolor=SURFACE2, font_family=MONO, font_color=INK, bordercolor=LINE),
     )
+    return fig
 
-    # divider between the price group and the macro group, positioned at the
-    # midpoint of the gap between column n_price's domain and column n_price+1's domain
-    price_axis_key = "xaxis" if n_price == 1 else f"xaxis{n_price}"
-    macro_axis_key = f"xaxis{n_price + 1}"
-    price_domain_end = fig.layout[price_axis_key].domain[1]
-    macro_domain_start = fig.layout[macro_axis_key].domain[0]
-    sep_x = (price_domain_end + macro_domain_start) / 2
 
-    fig.add_shape(
-        type="line",
-        xref="paper", yref="paper",
-        x0=sep_x, x1=sep_x, y0=0, y1=1,
-        line=dict(color=GOLD, width=1, dash="dot"),
+def macro_context_figure(df_window: pd.DataFrame) -> go.Figure:
+    keys = list(MACRO_SERIES.keys())
+    fig = make_subplots(rows=1, cols=len(keys), horizontal_spacing=0.04)
+
+    for i, key in enumerate(keys, start=1):
+        series = df_window[key].astype(float)
+        fig.add_trace(
+            go.Scatter(
+                x=df_window["date"], y=series,
+                mode="lines",
+                line=dict(color=GOLD, width=1.6, shape="hv"),
+                fill="tozeroy",
+                fillcolor=_rgba(GOLD, 0.08),
+                hovertemplate=f"{MACRO_SERIES[key]['label']} · %{{x|%b %Y}}<br>%{{y:.2f}}%<extra></extra>",
+            ),
+            row=1, col=i,
+        )
+        pad = (series.max() - series.min()) * 0.25 or 0.1
+        fig.update_yaxes(
+            range=[series.min() - pad, series.max() + pad],
+            showgrid=False, zeroline=False, showticklabels=False,
+            row=1, col=i,
+        )
+        _date_axis(fig, 1, i, nticks=4, tickformat="%b '%y")
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=SURFACE,
+        showlegend=False,
+        height=115,
+        margin=dict(l=0, r=0, t=6, b=4),
+        hoverlabel=dict(bgcolor=SURFACE2, font_family=MONO, font_color=INK, bordercolor=LINE),
     )
-
     return fig
 
 
@@ -491,38 +478,45 @@ def render_market_context(speech_date: date):
     price_start = (pd.Timestamp(speech_date) - relativedelta(months=PRICE_WINDOW_MONTHS)).date()
     macro_start = (pd.Timestamp(speech_date) - relativedelta(months=MACRO_WINDOW_MONTHS)).date()
 
+    # ── Price / vol assets: trailing 3 months ──
     st.markdown(
-        f'<div class="section-label"><span>Market Context</span>'
-        f'<span class="coverage">Price 3M: {price_start} → {speech_date}'
-        f' &nbsp;|&nbsp; Macro 1Y: {macro_start} → {speech_date}</span></div>',
+        f'<div class="section-label"><span>Price &amp; Vol · Trailing 3 Months</span>'
+        f'<span class="coverage">{price_start} → {speech_date}</span></div>',
         unsafe_allow_html=True,
     )
 
-    if price_win.empty or macro_win.empty:
-        st.info("No data in the selected windows for this date.")
-        return
+    if price_win.empty:
+        st.info("No price data in the trailing 3-month window for this date.")
+    else:
+        price_items = []
+        for meta in ASSETS.values():
+            series = price_win[meta["symbol"]].astype(float)
+            first, last = series.iloc[0], series.iloc[-1]
+            delta = (last - first) / first if first else 0.0
+            price_items.append((meta["symbol"], f"{last:,.2f}", delta, fmt_pct(delta)))
 
-    price_items = []
-    for meta in ASSETS.values():
-        series = price_win[meta["symbol"]].astype(float)
-        first, last = series.iloc[0], series.iloc[-1]
-        delta = (last - first) / first if first else 0.0
-        price_items.append((meta["symbol"], f"{last:,.2f}", delta, fmt_pct(delta)))
+        st.markdown(context_strip_html(price_items), unsafe_allow_html=True)
+        st.plotly_chart(price_context_figure(price_win), use_container_width=True, config={"displayModeBar": False})
 
-    macro_items = []
-    for key, meta in MACRO_SERIES.items():
-        series = macro_win[key].astype(float)
-        first, last = series.iloc[0], series.iloc[-1]
-        delta_pp = last - first
-        macro_items.append((meta["label"], f"{last:.2f}{meta['unit']}", delta_pp, f"{delta_pp:+.2f}pp"))
-
-    combined_items = price_items + macro_items
-    st.markdown(context_strip_html(combined_items, sep_index=len(price_items)), unsafe_allow_html=True)
-    st.plotly_chart(
-        combined_context_figure(price_win, macro_win),
-        use_container_width=True,
-        config={"displayModeBar": False},
+    # ── Macro indicators: trailing 1 year ──
+    st.markdown(
+        f'<div class="section-label"><span>Macro Indicators · Trailing 1 Year</span>'
+        f'<span class="coverage">{macro_start} → {speech_date}</span></div>',
+        unsafe_allow_html=True,
     )
+
+    if macro_win.empty:
+        st.info("No macro data in the trailing 1-year window for this date.")
+    else:
+        macro_items = []
+        for key, meta in MACRO_SERIES.items():
+            series = macro_win[key].astype(float)
+            first, last = series.iloc[0], series.iloc[-1]
+            delta_pp = last - first
+            macro_items.append((meta["label"], f"{last:.2f}{meta['unit']}", delta_pp, f"{delta_pp:+.2f}pp"))
+
+        st.markdown(context_strip_html(macro_items), unsafe_allow_html=True)
+        st.plotly_chart(macro_context_figure(macro_win), use_container_width=True, config={"displayModeBar": False})
 
 
 # ── Ticker tape ──────────────────────────────────────────────────────────
