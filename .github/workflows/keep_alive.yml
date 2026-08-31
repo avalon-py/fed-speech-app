@@ -3,7 +3,7 @@ name: Keep Streamlit Alive
 on:
   schedule:
     # Runs every 20 minutes (at minute 0, 20, and 40 of every hour)
-    - cron: '*/15 * * * *'
+    - cron: '*/40 * * * *'
   workflow_dispatch: # Allows manual triggers from the GitHub Actions tab
 
 jobs:
