@@ -233,7 +233,18 @@ def main():
             print("No new speeches found. Nothing to do.")
             return
 
-        print(f"Found {len(new_items)} new speech(es)/testimony to scrape:")
+        # The RSS feed lists items newest-first. Since 'id' is a Postgres
+        # serial assigned at insert time, inserting in feed order would
+        # give the newest item the lowest id and the oldest item the
+        # highest — backwards from the chronological id ordering the
+        # backfill established. Sorting oldest-first here keeps id order
+        # consistent with date order across the whole table, batch after
+        # batch. Items with an unparseable pubDate sort last within the
+        # batch rather than crashing the sort.
+        new_items.sort(key=lambda item: (parse_rss_pubdate(item["pub_date"]) is None,
+                                          parse_rss_pubdate(item["pub_date"])))
+
+        print(f"Found {len(new_items)} new speech(es)/testimony to scrape (oldest first):")
         for item in new_items:
             print(f"  - {item['title']}")
 
