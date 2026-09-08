@@ -3,17 +3,20 @@ name: Update Market Data Cache
 on:
   schedule:
     - cron: '0 3 * * *'   # 03:00 UTC daily — a few hours after US market close, buffer for data finalization
-  workflow_dispatch:        # lets you trigger it manually too, useful for testing
+  workflow_dispatch: {}
+
+concurrency:
+  group: update-market-data
+  cancel-in-progress: false
 
 permissions:
-  contents: write  # GITHUB_TOKEN needs write access to push the updated CSVs back
+  contents: read  # no CSV to commit back anymore — data lives in Supabase
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -23,15 +26,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements-cron.txt
 
-      - name: Fetch and validate data
+      - name: Fetch, validate, and upsert data
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python scripts/update_data.py
-
-      - name: Commit updated CSVs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dataset/macro_indicators.csv dataset/price_action.csv
-          git diff --quiet --cached || git commit -m "Update market data cache [automated]"
-          git push
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/update_data_db.py
