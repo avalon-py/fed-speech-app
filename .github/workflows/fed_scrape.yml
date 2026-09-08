@@ -32,10 +32,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r scripts/requirements.txt
 
       - name: Run scraper
-        run: python TOOLS_automate_scrape.py
+        run: python scripts/TOOLS_automate_scrape.py
 
       - name: Commit and push if data changed
         run: |
