@@ -1,0 +1,50 @@
+name: Fed Speech Scraper
+
+on:
+  schedule:
+    # Once a day. The RSS feed holds ~15 most recent entries and the Fed
+    # publishes roughly 2/week (occasionally a same-day cluster of 3-4),
+    # so a day between checks leaves a wide margin before anything could
+    # age off the feed unseen. Most daily runs will legitimately find
+    # nothing new — that's expected, not a sign anything's broken.
+    - cron: '0 13 * * *'  # 13:00 UTC = 20:00 WIB (Jakarta) — adjust as you like
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
+
+# Prevents two runs from racing to commit/push at the same time (e.g. a
+# manual trigger overlapping the schedule).
+concurrency:
+  group: fed-speech-scraper
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to commit the updated CSV/.seen_links.txt back
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python TOOLS_automate_scrape.py
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dataset/fed_speech.csv dataset/.seen_links.txt
+          if git diff --cached --quiet; then
+            echo "No new data — nothing to commit."
+          else
+            git commit -m "Auto-update: Fed speech/testimony scrape $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
