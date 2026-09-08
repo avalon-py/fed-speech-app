@@ -4,7 +4,7 @@ on:
   workflow_run:
     workflows: ["Fed Speech Scraper"]
     types: [completed]
-  workflow_dispatch: {}  # manual trigger from the Actions tab
+  workflow_dispatch: {}
 
 concurrency:
   group: fed-speech-embedder
@@ -15,15 +15,28 @@ permissions:
 
 jobs:
   embed:
-    # Only run if triggered manually, or if the scraper run it followed
-    # actually succeeded (skip embedding after a failed/cancelled scrape).
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repo (without LFS content yet)
         uses: actions/checkout@v4
+        with:
+          lfs: false  # we pull LFS manually below, so we can cache it
+
+      - name: Get LFS file hash
+        run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+
+      - name: Restore LFS cache
+        uses: actions/cache@v4
+        id: lfs-cache
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.lfs-assets-id') }}
+
+      - name: Git LFS pull
+        run: git lfs pull
 
       - name: Set up Python
         uses: actions/setup-python@v5
