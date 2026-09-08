@@ -10,14 +10,15 @@ on:
     - cron: '0 13 * * *'  # 13:00 UTC = 20:00 WIB (Jakarta) — adjust as you like
   workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
 
-# Prevents two runs from racing to commit/push at the same time (e.g. a
-# manual trigger overlapping the schedule).
+# Prevents two runs from racing to insert at the same time (e.g. a manual
+# trigger overlapping the schedule) — mostly harmless with ON CONFLICT DO
+# NOTHING in place, but avoids wasted duplicate scraping work.
 concurrency:
   group: fed-speech-scraper
   cancel-in-progress: false
 
 permissions:
-  contents: write  # needed to commit the updated CSV/.seen_links.txt back
+  contents: read  # only reads the repo now — no CSV to commit back anymore
 
 jobs:
   scrape:
@@ -35,16 +36,6 @@ jobs:
         run: pip install -r scripts/requirements-update_speech.txt
 
       - name: Run scraper
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python scripts/TOOLS_automate_scrape_db.py
-
-      - name: Commit and push if data changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dataset/fed_speech.csv dataset/.seen_links.txt
-          if git diff --cached --quiet; then
-            echo "No new data — nothing to commit."
-          else
-            git commit -m "Auto-update: Fed speech/testimony scrape $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
-          fi
