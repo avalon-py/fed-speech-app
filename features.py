@@ -45,6 +45,7 @@ def _engineer_price_features() -> pd.DataFrame:
 
     prices = pd.DataFrame(rows)
     prices["date"] = pd.to_datetime(prices["date"])
+    prices.columns = [c.upper() if c != "date" else c for c in prices.columns]
     prices = prices.sort_values("date").reset_index(drop=True)
 
     missing_assets = [c for c in ASSET_COLS if c not in prices.columns]
