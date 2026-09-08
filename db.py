@@ -5,15 +5,31 @@ from supabase import create_client, Client
 
 @lru_cache(maxsize=1)
 def get_supabase() -> Client:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_KEY"]
+    try:
+        import streamlit as st
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+
+    def _get(key: str) -> str:
+        if key in secrets:
+            return secrets[key]
+        if key in os.environ:
+            return os.environ[key]
+        raise KeyError(
+            f"'{key}' not found in st.secrets or os.environ. "
+            "On Streamlit Cloud, set it under Settings → Secrets. "
+            "Locally, set it in your shell or a .env file."
+        )
+
+    url = _get("SUPABASE_URL")
+    key = _get("SUPABASE_KEY")
     return create_client(url, key)
 
 
 def fetch_all_rows(table: str, order_col: str = "date", page_size: int = 1000) -> list[dict]:
     """
     Pages through .range() until a page comes back short of page_size.
-
     Supabase/PostgREST caps a single response at 1000 rows by default —
     if a table ever grows past that, a plain .select("*") silently
     truncates with no error, which would quietly feed the rolling
@@ -39,4 +55,3 @@ def fetch_all_rows(table: str, order_col: str = "date", page_size: int = 1000) -
             break
         start += page_size
     return rows
-  
