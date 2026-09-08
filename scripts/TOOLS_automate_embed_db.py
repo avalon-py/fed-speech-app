@@ -4,13 +4,10 @@ Fed Speech Embedder — Incremental Updater (Postgres)
 ======================================================
 
 Finds rows in fed_speech with a NULL embedding and fills them in using
-the local ONNX FinBERT model. Meant to run after the scraper adds new
-rows, but is safe to run any time — it only ever touches rows where
-embedding IS NULL, so running it twice in a row (or with nothing new
-to do) is a no-op.
+the local ONNX FinBERT model. Only touches rows where embedding IS
+NULL, so it's safe to run repeatedly / on a schedule.
 
-Requires the DB_URL environment variable (same Supabase pooler
-connection string as the scraper).
+Requires the DB_URL environment variable (Supabase pooler string).
 """
 
 import os
@@ -20,7 +17,7 @@ import numpy as np
 import onnxruntime as ort
 import psycopg2
 from pgvector.psycopg2 import register_vector
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 
 # ---------------------------------------------------------------------------
 # Config
@@ -28,7 +25,9 @@ from transformers import AutoTokenizer
 
 DB_URL = os.environ["DB_URL"]
 MODEL_DIR = os.environ.get("MODEL_DIR", "models/finbert-onnx")
-BATCH_COMMIT_EVERY = 20  # commit periodically so a late failure doesn't lose earlier work
+BATCH_COMMIT_EVERY = 20
+MAX_LENGTH = 512
+STRIDE = 50
 
 # ---------------------------------------------------------------------------
 # Embedding
@@ -42,7 +41,7 @@ def get_finbert_onnx(model_dir=MODEL_DIR):
     global _tokenizer, _session
     if _session is None:
         print(f"Loading ONNX FinBERT from {model_dir} ...")
-        _tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        _tokenizer = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
         _session = ort.InferenceSession(
             f"{model_dir}/model_fp16.onnx",
             providers=["CPUExecutionProvider"],
@@ -50,24 +49,50 @@ def get_finbert_onnx(model_dir=MODEL_DIR):
     return _tokenizer, _session
 
 
-def speech_embedding(text: str, model_dir=MODEL_DIR, max_length=512, stride=50) -> np.ndarray:
+def _chunk_ids(ids: list[int], max_length: int, stride: int) -> list[list[int]]:
+    """Split content token ids into overlapping windows. Each window
+    leaves room for a [CLS] and [SEP] to be added around it."""
+    window = max_length - 2
+    if len(ids) <= window:
+        return [ids]
+
+    chunks = []
+    step = window - stride
+    start = 0
+    while start < len(ids):
+        chunks.append(ids[start:start + window])
+        if start + window >= len(ids):
+            break
+        start += step
+    return chunks
+
+
+def speech_embedding(text: str, model_dir=MODEL_DIR, max_length=MAX_LENGTH, stride=STRIDE) -> np.ndarray:
     tokenizer, session = get_finbert_onnx(model_dir)
 
-    tokens = tokenizer(
-        text,
-        return_tensors="np",
-        truncation=True,
-        max_length=max_length,
-        stride=stride,
-        return_overflowing_tokens=True,
-        padding=True,
-    )
-    input_ids = tokens["input_ids"].astype(np.int64)
-    attention_mask = tokens["attention_mask"].astype(np.int64)
-    token_type_ids = tokens.get("token_type_ids")
-    token_type_ids = (
-        token_type_ids.astype(np.int64) if token_type_ids is not None else np.zeros_like(input_ids)
-    )
+    cls_id = tokenizer.token_to_id("[CLS]")
+    sep_id = tokenizer.token_to_id("[SEP]")
+    pad_id = tokenizer.token_to_id("[PAD]")
+    if pad_id is None:
+        pad_id = 0
+
+    base_ids = tokenizer.encode(text, add_special_tokens=False).ids
+    chunks = _chunk_ids(base_ids, max_length=max_length, stride=stride)
+
+    input_ids, attention_mask = [], []
+    for chunk in chunks:
+        ids = [cls_id] + chunk + [sep_id]
+        mask = [1] * len(ids)
+        pad_len = max_length - len(ids)
+        if pad_len > 0:
+            ids += [pad_id] * pad_len
+            mask += [0] * pad_len
+        input_ids.append(ids)
+        attention_mask.append(mask)
+
+    input_ids = np.array(input_ids, dtype=np.int64)
+    attention_mask = np.array(attention_mask, dtype=np.int64)
+    token_type_ids = np.zeros_like(input_ids)
 
     outputs = session.run(
         None,
@@ -118,9 +143,7 @@ def main():
             print("Nothing to do.")
             return
 
-        # Load the model once, up front, so a failure on row 1 doesn't
-        # leave you wondering whether the model itself is broken.
-        get_finbert_onnx()
+        get_finbert_onnx()  # load once, fail fast if the model itself is broken
 
         computed = 0
         failed_ids = []
@@ -139,13 +162,13 @@ def main():
             except Exception as e:
                 print(f"  ! Failed to embed row {row_id}: {e}", file=sys.stderr)
                 failed_ids.append(row_id)
-                conn.rollback()  # clear the failed transaction before continuing
+                conn.rollback()
                 continue
 
             if computed % BATCH_COMMIT_EVERY == 0:
                 conn.commit()
 
-        conn.commit()  # final commit for any remainder
+        conn.commit()
         print(f"\nComputed and stored {computed} embedding(s)")
 
         if failed_ids:
