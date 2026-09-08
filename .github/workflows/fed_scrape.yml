@@ -35,7 +35,7 @@ jobs:
         run: pip install -r scripts/requirements-update_speech.txt
 
       - name: Run scraper
-        run: python scripts/TOOLS_automate_scrape.py
+        run: python scripts/TOOLS_automate_scrape_db.py
 
       - name: Commit and push if data changed
         run: |
