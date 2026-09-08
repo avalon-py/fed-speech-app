@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from predict import load_models, load_finbert, predict
+from db import fetch_all_rows
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -275,16 +276,23 @@ def get_feature_columns():
     return joblib.load("models/feature_columns.pkl")
 
 
-@st.cache_data
+@st.cache_data(ttl=300)
 def load_price_data() -> pd.DataFrame:
-    df = pd.read_csv(os.path.join("dataset", "price_action.csv"))
+    # Was: pd.read_csv(dataset/price_action.csv). Now pulled from the
+    # Supabase table of the same name. TTL kept short (5 min) so the app
+    # picks up new rows from the daily sync cron without needing a redeploy.
+    rows = fetch_all_rows("price_action")
+    df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date")
 
 
-@st.cache_data
+@st.cache_data(ttl=300)
 def load_macro_data() -> pd.DataFrame:
-    df = pd.read_csv(os.path.join("dataset", "macro_indicators.csv"))
+    # Was: pd.read_csv(dataset/macro_indicators.csv). Now pulled from the
+    # Supabase table of the same name.
+    rows = fetch_all_rows("macro_indicators")
+    df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date")
 
