@@ -278,14 +278,11 @@ def get_feature_columns():
 
 @st.cache_data(ttl=300)
 def load_price_data() -> pd.DataFrame:
-    # Was: pd.read_csv(dataset/price_action.csv). Now pulled from the
-    # Supabase table of the same name. TTL kept short (5 min) so the app
-    # picks up new rows from the daily sync cron without needing a redeploy.
     rows = fetch_all_rows("price_action")
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
+    df.columns = [c.upper() if c != "date" else c for c in df.columns]
     return df.sort_values("date")
-
 
 @st.cache_data(ttl=300)
 def load_macro_data() -> pd.DataFrame:
