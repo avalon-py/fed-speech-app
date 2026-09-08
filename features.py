@@ -1,3 +1,18 @@
+"""
+Feature assembly for inference.
+
+IMPORTANT: This module reads price/macro history from Supabase tables
+(price_action, macro_indicators) instead of local CSVs. A GitHub Actions
+cron job keeps those tables refreshed daily (price_action <- yfinance,
+macro_indicators <- FRED), since Streamlit Cloud has both gateways blocked
+at runtime.
+
+Everything below reproduces, row for row, the same feature engineering
+that FE_main.ipynb applied at training time (cell 4 for macro, cell 7 for
+price). If this ever drifts from the notebook again, the model will
+silently see out-of-distribution inputs, so keep the two in sync.
+"""
+
 import pandas as pd
 import numpy as np
 
@@ -7,6 +22,7 @@ from db import fetch_all_rows
 ASSET_COLS = ["SPX", "GOLD", "TNX", "DXY", "VIX"]
 
 # Macro columns that got the 30-day publication-lag shift in training.
+# interest_rate (FEDFUNDS) was NOT shifted.
 MACRO_LAG_COLS = ["unemployment", "growth_rate"]
 
 PRICE_TABLE = "price_action"
@@ -14,6 +30,12 @@ MACRO_TABLE = "macro_indicators"
 
 
 def _engineer_price_features() -> pd.DataFrame:
+    """
+    Reproduces notebook cell 7 (the price-side half of it) on the full
+    history in the price_action table. Returns one row per date with the
+    engineered columns only (no raw close prices - those weren't in
+    X_train either).
+    """
     rows = fetch_all_rows(PRICE_TABLE)
     if not rows:
         raise RuntimeError(
@@ -57,6 +79,10 @@ def _engineer_price_features() -> pd.DataFrame:
 
 
 def _engineer_macro_features() -> pd.DataFrame:
+    """
+    Reproduces notebook cell 4: shift unemployment/growth_rate by 30 rows
+    (publication lag), reindex to a daily calendar, forward-fill.
+    """
     rows = fetch_all_rows(MACRO_TABLE)
     if not rows:
         raise RuntimeError(
@@ -80,3 +106,74 @@ def _engineer_macro_features() -> pd.DataFrame:
     macro_daily = macro_daily.rename(columns={"index": "date"})
 
     return macro_daily[["date", "unemployment", "interest_rate", "growth_rate"]]
+
+
+def _last_row_on_or_before(df: pd.DataFrame, date: "pd.Timestamp | np.datetime64") -> pd.Series:
+    subset = df[df["date"] <= pd.Timestamp(date)]
+    if subset.empty:
+        raise RuntimeError(
+            f"No rows on or before {date} — table history doesn't reach back that far."
+        )
+    return subset.sort_values("date").iloc[-1]
+
+
+def fetch_price_features(date) -> dict:
+    """
+    Engineered price features (mom/t-/vol, per asset) as of `date`,
+    read from the price_action Supabase table instead of yfinance.
+    """
+    engineered = _engineer_price_features()
+    row = _last_row_on_or_before(engineered, date)
+    feats = row.drop(labels=["date"]).to_dict()
+
+    missing = [k for k, v in feats.items() if pd.isna(v)]
+    if missing:
+        raise RuntimeError(
+            f"Not enough price history in '{PRICE_TABLE}' to compute {missing} "
+            f"for {date} (need up to 31 prior trading days)."
+        )
+    return feats
+
+
+def fetch_macro_features(date) -> dict:
+    """
+    Macro indicators (with the same 30-day lag applied at training time)
+    as of `date`, read from the macro_indicators Supabase table instead
+    of FRED.
+    """
+    engineered = _engineer_macro_features()
+    row = _last_row_on_or_before(engineered, date)
+    feats = row.drop(labels=["date"]).to_dict()
+
+    missing = [k for k, v in feats.items() if pd.isna(v)]
+    if missing:
+        raise RuntimeError(
+            f"Not enough macro history in '{MACRO_TABLE}' to compute {missing} for {date}."
+        )
+    return feats
+
+
+def build_feature_vector(
+    embedding: np.ndarray,
+    date,
+    feature_columns: list,  # X_train.columns — must match exactly!
+) -> pd.DataFrame:
+    """
+    Assemble the full feature vector in the same column order as X_train.
+    """
+    price_features = fetch_price_features(date)
+    macro_features = fetch_macro_features(date)
+
+    all_features = {**price_features, **macro_features}
+
+    for i, val in enumerate(embedding):
+        all_features[f"emb_{i}"] = val
+
+    feature_df = pd.DataFrame([all_features])
+    feature_df = feature_df.reindex(columns=feature_columns)
+
+    missing = feature_df.columns[feature_df.isnull().any()].tolist()
+    if missing:
+        raise RuntimeError(f"Missing features after assembly: {missing}")
+
+    return feature_df
