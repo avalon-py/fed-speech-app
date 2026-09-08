@@ -1,0 +1,39 @@
+name: Fed Speech Embedder
+
+on:
+  workflow_run:
+    workflows: ["Fed Speech Scraper"]
+    types: [completed]
+  workflow_dispatch: {}  # manual trigger from the Actions tab
+
+concurrency:
+  group: fed-speech-embedder
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  embed:
+    # Only run if triggered manually, or if the scraper run it followed
+    # actually succeeded (skip embedding after a failed/cancelled scrape).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements-embed.txt
+
+      - name: Run embedder
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/TOOLS_automate_embed_db.py
