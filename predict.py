@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import joblib
 import onnxruntime as ort
@@ -17,10 +18,31 @@ MAX_LENGTH = 512
 STRIDE = 50
 
 
-def load_models(models_dir: str = "models") -> dict:
-    return {
-        col: joblib.load(os.path.join(models_dir, f"{col}.pkl"))
+def load_models(production_dir: str = "models_el/production") -> dict:
+    """
+    Loads both halves of the sign+magnitude stack, plus the decision
+    thresholds that go with the sign classifiers.
+
+    Returns a dict with three keys:
+      - "magnitude": {col: HistGradientBoostingRegressor}
+      - "sign":      {col: HistGradientBoostingClassifier}
+      - "thresholds": {col: float}
+    """
+    magnitude_models = {
+        col: joblib.load(os.path.join(production_dir, "magnitude", f"{col}.pkl"))
         for col in TARGET_COLS
+    }
+    sign_models = {
+        col: joblib.load(os.path.join(production_dir, "sign", f"{col}.pkl"))
+        for col in TARGET_COLS
+    }
+    with open(os.path.join(production_dir, "thresholds.json")) as f:
+        thresholds = json.load(f)
+
+    return {
+        "magnitude": magnitude_models,
+        "sign": sign_models,
+        "thresholds": thresholds,
     }
 
 
@@ -29,35 +51,19 @@ def load_finbert(onnx_dir: str = FINBERT_ONNX_DIR):
     Loads the tokenizer + a local FP16 ONNX FinBERT session, both read
     straight from disk. No torch, no transformers, no network call to
     Hugging Face at runtime.
-
-    Uses tokenizers.Tokenizer.from_file() against tokenizer.json directly
-    instead of transformers.AutoTokenizer - same vocab/merges, ~150-250MB
-    less import overhead, and no dependency on the transformers package
-    (huggingface-hub, safetensors, regex, tqdm, typer, etc.) at all.
     """
     tokenizer = Tokenizer.from_file(os.path.join(onnx_dir, "tokenizer.json"))
 
-    # Match the old transformers call: truncation=True, max_length=512,
-    # stride=50, return_overflowing_tokens=True, padding=True
     tokenizer.enable_truncation(max_length=MAX_LENGTH, stride=STRIDE, strategy="only_first")
 
     pad_id = tokenizer.token_to_id("[PAD]")
     if pad_id is None:
-        pad_id = 0  # BERT-family vocabs put [PAD] at index 0 as a fallback
-    # Pad every chunk to MAX_LENGTH rather than "longest in batch" - matches
-    # the max_length cap already in play and keeps every ONNX input a fixed,
-    # predictable shape.
+        pad_id = 0
     tokenizer.enable_padding(pad_id=pad_id, pad_token="[PAD]", length=MAX_LENGTH)
 
     sess_options = ort.SessionOptions()
-    # Small Streamlit instances only get 1 CPU core anyway; keeping thread
-    # pools at 1 avoids onnxruntime spinning up extra threads that just
-    # burn RAM without speeding anything up.
     sess_options.intra_op_num_threads = 1
     sess_options.inter_op_num_threads = 1
-    # Default arena pre-allocates and grows greedily; disabling it trims
-    # peak RSS at a small cost to per-call alloc speed - worth it here
-    # given the 1GB ceiling.
     sess_options.enable_cpu_mem_arena = False
 
     session = ort.InferenceSession(
@@ -70,13 +76,6 @@ def load_finbert(onnx_dir: str = FINBERT_ONNX_DIR):
 
 
 def embed_speech(text: str, tokenizer, session) -> np.ndarray:
-    """
-    Same 512-token sliding-window chunking as before, run as a single
-    local batched ONNX forward pass. With tokenizers, overflow chunks
-    come back via Encoding.overflowing instead of a return_overflowing_tokens
-    kwarg - the truncation/padding config set once in load_finbert()
-    governs both.
-    """
     encoding = tokenizer.encode(text)
     all_encodings = [encoding] + encoding.overflowing
 
@@ -90,16 +89,26 @@ def embed_speech(text: str, tokenizer, session) -> np.ndarray:
         "token_type_ids": token_type_ids,
     }
 
-    # Only pass along the inputs this particular ONNX graph actually
-    # expects (e.g. some exports omit token_type_ids).
     session_input_names = {inp.name for inp in session.get_inputs()}
     feed = {name: arr for name, arr in tokens.items() if name in session_input_names}
 
     outputs = session.run(None, feed)
-    last_hidden_state = outputs[0]  # (num_chunks, seq_len, hidden)
+    last_hidden_state = outputs[0]
 
     cls_embeddings = last_hidden_state[:, 0, :].astype(np.float32)
     return cls_embeddings.mean(axis=0)
+
+
+def combined_predict(col: str, X, ml_models: dict) -> float:
+    """
+    sign x magnitude, mirroring the notebook's combined_predict:
+      - sign comes from the classifier's up-probability vs. its tuned threshold
+      - magnitude comes from the regressor's |raw output|
+    """
+    proba = ml_models["sign"][col].predict_proba(X)[:, 1][0]
+    sign = 1 if proba >= ml_models["thresholds"][col] else -1
+    magnitude = abs(ml_models["magnitude"][col].predict(X)[0])
+    return sign * magnitude, proba
 
 
 def predict(
@@ -110,8 +119,21 @@ def predict(
     ml_models: dict,
     feature_columns: list,
 ) -> dict:
+    """
+    Returns, per target:
+      {"pred": signed % move, "up_probability": raw classifier confidence}
+    up_probability is included alongside pred since it's a genuinely
+    different piece of information than the signed magnitude (confidence
+    vs. size) — dropping it would throw away something the two-stage
+    model actually computes.
+    """
     from features import build_feature_vector
 
     embedding = embed_speech(text, tokenizer, session)
     X = build_feature_vector(embedding, date, feature_columns)
-    return {col: model.predict(X)[0] for col, model in ml_models.items()}
+
+    results = {}
+    for col in TARGET_COLS:
+        pred, proba = combined_predict(col, X, ml_models)
+        results[col] = {"pred": pred, "up_probability": proba}
+    return results
