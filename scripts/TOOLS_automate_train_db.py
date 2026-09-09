@@ -174,27 +174,24 @@ def build_dataset(conn) -> pd.DataFrame:
     if speeches.empty:
         raise RuntimeError("fed_speech has no embedded rows — nothing to train on.")
 
-    price_engineered = _engineer_price_features()
-    macro_engineered = _engineer_macro_features()
-    raw_prices = fetch_raw_prices(conn)
-    targets = compute_targets(raw_prices)
+    raw_prices = fetch_raw_prices(conn)               # ← single fetch of price_action
+    price_engineered = _engineer_price_features_local(raw_prices)   # ← computed locally, no re-fetch
+    macro_engineered = _engineer_macro_features_local(conn)
+    targets = compute_targets(raw_prices)              # ← reuses the SAME fetch
 
     merged = price_engineered.merge(macro_engineered, on="date", how="inner")
     merged = merged.merge(targets, on="date", how="left")
-
     df = speeches.merge(merged, on="date", how="left")
     df["sample_weight"] = df["speaker"].apply(get_weight)
 
     emb_matrix = np.vstack(df["embedding"].apply(_vector_to_array).values)
     assert emb_matrix.ndim == 2 and emb_matrix.shape[1] > 1, (
-        f"Embedding matrix has unexpected shape {emb_matrix.shape} — "
-        "check that Vector objects are being unpacked correctly."
+        f"Embedding matrix has unexpected shape {emb_matrix.shape}"
     )
     emb_df = pd.DataFrame(emb_matrix, index=df.index, columns=[f"emb_{i}" for i in range(emb_matrix.shape[1])])
     df = pd.concat([df.drop(columns=["embedding"]), emb_df], axis=1)
 
     return df.sort_values("date").reset_index(drop=True)
-
 
 def purged_split(df: pd.DataFrame):
     today = datetime.now(timezone.utc).date()
@@ -212,6 +209,44 @@ def purged_split(df: pd.DataFrame):
     }
     return train_df, eval_df, windows
 
+def _engineer_price_features_local(raw_prices: pd.DataFrame) -> pd.DataFrame:
+    """Same feature logic as features.py's _engineer_price_features, but
+    computed from an already-fetched DataFrame instead of making its own
+    REST call — avoids double-fetching price_action."""
+    prices = raw_prices.copy()
+    engineered_cols = ["date"]
+    for col in ["SPX", "GOLD", "TNX", "DXY", "VIX"]:
+        log_ret = np.log(prices[col] / prices[col].shift(1))
+        prices[f"{col}_mom_3"] = prices[col].shift(1) / prices[col].shift(4) - 1
+        prices[f"{col}_mom_7"] = prices[col].shift(1) / prices[col].shift(8) - 1
+        prices[f"{col}_mom_30"] = prices[col].shift(1) / prices[col].shift(31) - 1
+        prices[f"{col}_t-3"] = log_ret.shift(1).rolling(3).mean()
+        prices[f"{col}_t-7"] = log_ret.shift(1).rolling(7).mean()
+        prices[f"{col}_t-30"] = log_ret.shift(1).rolling(30).mean()
+        prices[f"{col}_vol_7"] = log_ret.shift(1).rolling(7).std()
+        prices[f"{col}_vol_30"] = log_ret.shift(1).rolling(30).std()
+        engineered_cols += [f"{col}_mom_3", f"{col}_mom_7", f"{col}_mom_30",
+                             f"{col}_t-3", f"{col}_t-7", f"{col}_t-30",
+                             f"{col}_vol_7", f"{col}_vol_30"]
+    return prices[engineered_cols]
+
+
+def _engineer_macro_features_local(conn) -> pd.DataFrame:
+    """Same as features.py's _engineer_macro_features, but via psycopg2
+    directly instead of REST."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT date, unemployment, interest_rate, growth_rate FROM macro_indicators ORDER BY date")
+        rows = cur.fetchall()
+    macro = pd.DataFrame(rows, columns=["date", "unemployment", "interest_rate", "growth_rate"])
+    macro["date"] = pd.to_datetime(macro["date"])
+    macro = macro.set_index("date").sort_index()
+
+    for col in ["unemployment", "growth_rate"]:
+        macro[col] = macro[col].shift(30)
+
+    daily_index = pd.date_range(start=macro.index.min(), end=macro.index.max(), freq="D")
+    macro_daily = macro.reindex(daily_index).ffill().reset_index().rename(columns={"index": "date"})
+    return macro_daily[["date", "unemployment", "interest_rate", "growth_rate"]]
 
 # ---------------------------------------------------------------------------
 # Modeling — plain fit, no search. Sign classifier's threshold is still
