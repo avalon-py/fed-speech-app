@@ -18,6 +18,8 @@ import onnxruntime as ort
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from tokenizers import Tokenizer
+from pipeline_logging import start_run, finish_run  # add near the top, with the other imports
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -134,6 +136,7 @@ def update_embedding(conn, row_id: int, embedding: np.ndarray) -> None:
 def main():
     conn = psycopg2.connect(DB_URL)
     register_vector(conn)
+    run_id = start_run(conn, "embedder")
 
     try:
         rows = fetch_unembedded_rows(conn)
@@ -141,9 +144,11 @@ def main():
 
         if not rows:
             print("Nothing to do.")
+            finish_run(conn, run_id, status="success", rows_processed=0,
+                       message="Nothing to do.")
             return
 
-        get_finbert_onnx()  # load once, fail fast if the model itself is broken
+        get_finbert_onnx()
 
         computed = 0
         failed_ids = []
@@ -176,6 +181,16 @@ def main():
             for rid in failed_ids:
                 print(f"  - id {rid}", file=sys.stderr)
             print("They're still NULL, so the next run will retry them.", file=sys.stderr)
+
+        finish_run(
+            conn, run_id, status="success", rows_processed=computed,
+            message=f"Embedded {computed} speech(es)",
+            details={"failed_ids": failed_ids} if failed_ids else None,
+        )
+
+    except Exception as e:
+        finish_run(conn, run_id, status="failed", error_message=str(e))
+        raise
 
     finally:
         conn.close()
