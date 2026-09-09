@@ -27,13 +27,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r scripts/requirements-train.txt
-
+        
       - name: Run trainer
         id: train
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -u scripts/TOOLS_automate_train_db.py
         
       - name: Commit and push new model artifacts
