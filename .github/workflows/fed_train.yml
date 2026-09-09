@@ -1,0 +1,44 @@
+name: Fed Speech Model Trainer
+
+on:
+  schedule:
+    - cron: '0 4 1 * *'   # 04:00 UTC on the 1st of every month
+  workflow_dispatch: {}
+
+concurrency:
+  group: fed-speech-trainer
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needs to push new model artifacts back to the repo
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements-train.txt
+
+      - name: Run trainer
+        id: train
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/TOOLS_automate_train_db.py
+
+      - name: Commit and push new model artifacts
+        if: steps.train.outputs.promoted == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models_el/production
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Retrain: monthly rolling-window model update [skip ci]"
+          git push
