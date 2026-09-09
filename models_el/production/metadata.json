@@ -1,0 +1,22 @@
+{
+  "trained_at": "2026-09-09T03:21:08.722423+00:00",
+  "split_date": "2023-01-01",
+  "train_start": "1996-06-13",
+  "train_end": "2022-12-01",
+  "test_start": "2023-01-06",
+  "test_end": "2025-12-15",
+  "targets": [
+    "SPX_t+3",
+    "SPX_t+7",
+    "SPX_t+30",
+    "GOLD_t+3",
+    "GOLD_t+7",
+    "GOLD_t+30",
+    "VIX_t+3",
+    "VIX_t+7",
+    "VIX_t+30",
+    "TNX_t+3",
+    "TNX_t+7",
+    "TNX_t+30"
+  ]
+}
