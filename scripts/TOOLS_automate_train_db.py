@@ -6,8 +6,21 @@ Fed Speech Model Trainer — Rolling-Window Continuous Training (Postgres)
 Runs monthly. Retrains the two-stage sign+magnitude stack on a rolling
 window of history, evaluates on a trailing, fully-realized eval window,
 and promotes the new model unconditionally IF it passes a cheap sanity
-gate (not a performance-margin gate — see conversation history for why:
-recency is preferred by design, sanity just catches pipeline breakage).
+gate (not a performance-margin gate — recency is preferred by design,
+sanity just catches pipeline breakage).
+
+NOTE ON HYPERPARAMETERS: this script does NOT run Optuna. Re-tuning on
+every rolling window adds selection variance without adding signal (a
+metric swing becomes unclear: did the market change, or did the search
+just land somewhere different this time?) — and it's the entire reason
+this job used to take ~1hr, most of which was Optuna, not actual
+training. Hyperparameter tuning is a separate, lower-frequency concern
+(quarterly/semi-annually), meant to live in its own script. Until that
+script exists, get_hyperparams() below returns fixed, hand-picked
+defaults derived from the ranges the original notebook's Optuna search
+converged around. When the tuner script exists, swap get_hyperparams()
+to read from wherever it writes its output (a JSON file, a DB table,
+etc.) — nothing else in this script needs to change.
 
 Windowing:
   - eval_end   = today - MAX_HORIZON days        (last date with a fully
@@ -19,9 +32,10 @@ Windowing:
                                                     into the eval window)
   - train_start = earliest available speech date
 
-Requires DB_URL. Writes model artifacts to models_el/production/ locally;
-the calling workflow is responsible for committing/pushing them if this
-script reports promoted=true via GITHUB_OUTPUT.
+Requires DB_URL, SUPABASE_URL, SUPABASE_KEY. Writes model artifacts to
+models_el/production/ locally; the calling workflow is responsible for
+committing/pushing them if this script reports promoted=true via
+GITHUB_OUTPUT.
 """
 
 import json
@@ -32,7 +46,6 @@ from datetime import datetime, timedelta, timezone
 
 import joblib
 import numpy as np
-import optuna
 import pandas as pd
 import psycopg2
 from dateutil.relativedelta import relativedelta
@@ -66,15 +79,41 @@ TARGET_COLS = [f"{a}_t+{h}" for a in TARGET_ASSETS for h in HORIZONS]
 
 MAX_HORIZON = 30
 EVAL_WINDOW_MONTHS = 4
-N_TRIALS = int(os.environ.get("N_TRIALS", "20"))  # lower via env var for faster/cheaper runs
 
 # Sanity-gate thresholds — deliberately loose. This is "not obviously
-# broken," not "good." See conversation history for rationale.
+# broken," not "good."
 MIN_TRAIN_ROWS = 200
 MIN_EVAL_ROWS = 10
-MIN_PRED_STD = 1e-6          # predictions collapsed to ~constant = broken
-MAX_ABS_PRED = 5.0           # a >500% predicted move = something's wrong
-MIN_SIGN_AUC = 0.30          # AUC this far below 0.5 suggests an inverted sign, not just noise
+MIN_PRED_STD = 1e-6
+MAX_ABS_PRED = 5.0
+MIN_SIGN_AUC = 0.30
+
+
+# ---------------------------------------------------------------------------
+# Fixed hyperparameters (no Optuna) — see module docstring.
+# ---------------------------------------------------------------------------
+
+def get_magnitude_hyperparams(asset: str) -> dict:
+    if asset in ("SPX", "VIX"):
+        base = dict(max_depth=3, max_leaf_nodes=18, min_samples_leaf=55,
+                    l2_regularization=4.0, learning_rate=0.01, max_iter=1000)
+    elif asset == "GOLD":
+        base = dict(max_depth=2, max_leaf_nodes=14, min_samples_leaf=75,
+                    l2_regularization=6.0, learning_rate=0.01, max_iter=1000)
+    else:  # TNX
+        base = dict(max_depth=2, max_leaf_nodes=10, min_samples_leaf=90,
+                    l2_regularization=7.0, learning_rate=0.01, max_iter=1000)
+    return {**base, "max_bins": 255, "early_stopping": True,
+            "n_iter_no_change": 50, "validation_fraction": 0.15, "random_state": 42}
+
+
+def get_sign_hyperparams(asset: str) -> dict:
+    # Classifier search space in the notebook wasn't asset-differentiated
+    # (unlike the regressor), so one fixed profile covers all four assets.
+    base = dict(max_iter=500, learning_rate=0.03, max_depth=3,
+                max_leaf_nodes=20, min_samples_leaf=50, l2_regularization=1.0)
+    return {**base, "max_bins": 255, "early_stopping": True,
+            "n_iter_no_change": 30, "validation_fraction": 0.15, "random_state": 42}
 
 
 # ---------------------------------------------------------------------------
@@ -114,12 +153,20 @@ def fetch_raw_prices(conn) -> pd.DataFrame:
 
 
 def compute_targets(prices: pd.DataFrame) -> pd.DataFrame:
-    """Forward returns at t+3/t+7/t+30, SPX/GOLD/VIX/TNX only."""
     out = prices[["date"]].copy()
     for col in TARGET_ASSETS:
         for h in HORIZONS:
             out[f"{col}_t+{h}"] = (prices[col].shift(-(h + 1)) / prices[col].shift(-1)) - 1
     return out
+
+
+def _vector_to_array(v) -> np.ndarray:
+    """pgvector's Vector wrapper (from register_vector) doesn't auto-convert
+    via np.asarray the way a plain list/ndarray does — needs explicit
+    unpacking via .to_list() first."""
+    if hasattr(v, "to_list"):
+        return np.asarray(v.to_list(), dtype=np.float32)
+    return np.asarray(v, dtype=np.float32)
 
 
 def build_dataset(conn) -> pd.DataFrame:
@@ -138,7 +185,11 @@ def build_dataset(conn) -> pd.DataFrame:
     df = speeches.merge(merged, on="date", how="left")
     df["sample_weight"] = df["speaker"].apply(get_weight)
 
-    emb_matrix = np.vstack(df["embedding"].apply(np.asarray).values)
+    emb_matrix = np.vstack(df["embedding"].apply(_vector_to_array).values)
+    assert emb_matrix.ndim == 2 and emb_matrix.shape[1] > 1, (
+        f"Embedding matrix has unexpected shape {emb_matrix.shape} — "
+        "check that Vector objects are being unpacked correctly."
+    )
     emb_df = pd.DataFrame(emb_matrix, index=df.index, columns=[f"emb_{i}" for i in range(emb_matrix.shape[1])])
     df = pd.concat([df.drop(columns=["embedding"]), emb_df], axis=1)
 
@@ -163,57 +214,10 @@ def purged_split(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# Modeling — asset-aware Optuna search spaces, purged CV, sign+magnitude stack
-# (mirrors EL_main.ipynb; see that notebook for the original derivation)
+# Modeling — plain fit, no search. Sign classifier's threshold is still
+# derived from purged out-of-fold predictions (that's a data-driven
+# calibration step, not a hyperparameter search, so it stays).
 # ---------------------------------------------------------------------------
-
-def regressor_search_space(trial, asset):
-    if asset in ("SPX", "VIX"):
-        return dict(
-            max_depth=trial.suggest_int("max_depth", 2, 4),
-            max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 12, 25),
-            min_samples_leaf=trial.suggest_int("min_samples_leaf", 30, 80),
-            l2_regularization=trial.suggest_float("l2_regularization", 2.0, 8.0, log=True),
-            learning_rate=trial.suggest_float("learning_rate", 0.005, 0.02, log=True),
-        )
-    elif asset == "GOLD":
-        return dict(
-            max_depth=trial.suggest_int("max_depth", 2, 3),
-            max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 10, 18),
-            min_samples_leaf=trial.suggest_int("min_samples_leaf", 50, 100),
-            l2_regularization=trial.suggest_float("l2_regularization", 4.0, 10.0, log=True),
-            learning_rate=trial.suggest_float("learning_rate", 0.005, 0.015, log=True),
-        )
-    else:  # TNX
-        return dict(
-            max_depth=2, max_leaf_nodes=10,
-            min_samples_leaf=trial.suggest_int("min_samples_leaf", 60, 120),
-            l2_regularization=trial.suggest_float("l2_regularization", 5.0, 10.0, log=True),
-            learning_rate=0.01,
-        )
-
-
-def regressor_objective(trial, X, y, sample_weights, asset, horizon):
-    params = {
-        **regressor_search_space(trial, asset),
-        "max_iter": trial.suggest_int("max_iter", 500, 1500, step=100),
-        "max_bins": 255, "early_stopping": True,
-        "n_iter_no_change": 50, "validation_fraction": 0.15, "random_state": 42,
-    }
-    tscv = TimeSeriesSplit(n_splits=5)
-    cv_aucs = []
-    for tr_idx, val_idx in tscv.split(X):
-        purged = tr_idx[:-horizon] if horizon > 0 else tr_idx
-        if len(purged) < 50:
-            continue
-        model = HistGradientBoostingRegressor(**params)
-        model.fit(X.iloc[purged], y.iloc[purged], sample_weight=sample_weights.iloc[purged])
-        pred = model.predict(X.iloc[val_idx])
-        y_bin = (y.iloc[val_idx] > 0).astype(int)
-        if len(np.unique(y_bin)) == 2:
-            cv_aucs.append(roc_auc_score(y_bin, pred))
-    return np.mean(cv_aucs) if cv_aucs else 0.0
-
 
 def get_class_weight_multiplier(y_bin, neg_boost=1.0):
     n_pos, n_neg = y_bin.sum(), len(y_bin) - y_bin.sum()
@@ -224,39 +228,7 @@ def get_class_weight_multiplier(y_bin, neg_boost=1.0):
     return np.where(y_bin == 1, w_pos, w_neg)
 
 
-def classifier_objective(trial, X, y_bin, sample_weights, horizon):
-    params = {
-        "max_iter": trial.suggest_int("max_iter", 200, 800, step=50),
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-        "max_depth": trial.suggest_int("max_depth", 2, 5),
-        "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 8, 31),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 20, 100),
-        "l2_regularization": trial.suggest_float("l2_regularization", 1e-3, 10.0, log=True),
-        "max_bins": 255, "early_stopping": True,
-        "n_iter_no_change": 30, "validation_fraction": 0.15, "random_state": 42,
-    }
-    tscv = TimeSeriesSplit(n_splits=5)
-    fold_f1s = []
-    for tr_idx, val_idx in tscv.split(X):
-        purged = tr_idx[:-horizon] if horizon > 0 else tr_idx
-        if len(purged) < 50:
-            continue
-        y_tr, y_val = y_bin[purged], y_bin[val_idx]
-        if len(np.unique(y_tr)) < 2 or len(np.unique(y_val)) < 2:
-            continue
-        w_tr = sample_weights[purged]
-        model = HistGradientBoostingClassifier(**params)
-        model.fit(X.iloc[purged], y_tr, sample_weight=w_tr)
-        proba = model.predict_proba(X.iloc[val_idx])[:, 1]
-        best_f1 = max(
-            f1_score(y_val, (proba >= t).astype(int), average="macro", zero_division=0)
-            for t in np.linspace(0.1, 0.9, 17)
-        )
-        fold_f1s.append(best_f1)
-    return np.mean(fold_f1s) if fold_f1s else 0.0
-
-
-def train_target(col, X_train, y_train, w_train, feature_columns):
+def train_target(col, X_train, y_train, w_train):
     asset = col.split("_")[0]
     horizon = int(col.split("+")[1])
 
@@ -264,27 +236,20 @@ def train_target(col, X_train, y_train, w_train, feature_columns):
     valid = y_col.notna()
     X_full, y_full, w_full = X_train[valid], y_col[valid], w_train[valid]
 
-    # ── magnitude regressor ──
-    study_r = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-    study_r.optimize(lambda t: regressor_objective(t, X_full, y_full, w_full, asset, horizon),
-                      n_trials=N_TRIALS, show_progress_bar=False)
-    reg_params = {**study_r.best_params, "max_bins": 255, "early_stopping": True,
-                  "n_iter_no_change": 50, "validation_fraction": 0.15, "random_state": 42}
+    # ── magnitude regressor — plain fit, fixed hyperparams ──
+    reg_params = get_magnitude_hyperparams(asset)
     magnitude_model = HistGradientBoostingRegressor(**reg_params)
     magnitude_model.fit(X_full, y_full, sample_weight=w_full)
 
-    # ── sign classifier ──
+    # ── sign classifier — plain fit, fixed hyperparams ──
+    clf_params = get_sign_hyperparams(asset)
     y_bin_full = (y_full > 0).astype(int).values
     class_w = get_class_weight_multiplier(y_bin_full)
     w_clf_full = w_full.values * class_w
 
-    study_c = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-    study_c.optimize(lambda t: classifier_objective(t, X_full, y_bin_full, w_clf_full, horizon),
-                      n_trials=N_TRIALS, show_progress_bar=False)
-    clf_params = {**study_c.best_params, "max_bins": 255, "early_stopping": True,
-                  "n_iter_no_change": 30, "validation_fraction": 0.15, "random_state": 42}
-
-    # OOF threshold selection
+    # OOF threshold selection — still purged, still needed: the decision
+    # cutoff is calibration on THIS window's data, not a hyperparameter
+    # search over model architecture.
     tscv = TimeSeriesSplit(n_splits=5)
     oof_proba, oof_true = [], []
     for tr_idx, val_idx in tscv.split(X_full):
@@ -384,6 +349,7 @@ def save_artifacts(sign_models, thresholds, magnitude_models, hyperparams,
             "trained_at": datetime.now(timezone.utc).isoformat(),
             **{k: str(v) for k, v in windows.items()},
             "targets": TARGET_COLS,
+            "hyperparam_source": "fixed_defaults",  # flips to "tuner" once that script exists
         }, f, indent=2)
 
 
@@ -420,8 +386,8 @@ def main():
         all_metrics, all_preds = {}, {}
 
         for col in TARGET_COLS:
-            print(f"\n{'='*60}\nTraining {col}\n{'='*60}")
-            sign_model, threshold, magnitude_model, hp = train_target(col, X_train, y_train, w_train, feature_columns)
+            print(f"Training {col}...")
+            sign_model, threshold, magnitude_model, hp = train_target(col, X_train, y_train, w_train)
             sign_models[col], thresholds[col], magnitude_models[col], hyperparams[col] = (
                 sign_model, threshold, magnitude_model, hp
             )
