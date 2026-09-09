@@ -263,8 +263,7 @@ st.markdown(
 # ── Load everything once (cached) ──────────────────────────────────────────
 @st.cache_resource
 def get_models():
-    return load_models("models")
-
+    return load_models("models_el/production")
 
 @st.cache_resource
 def get_finbert():
@@ -273,8 +272,8 @@ def get_finbert():
 
 @st.cache_data
 def get_feature_columns():
-    return joblib.load("models/feature_columns.pkl")
-
+    return joblib.load("models_el/production/feature_columns.pkl")
+    
 
 @st.cache_data(ttl=300)
 def load_price_data() -> pd.DataFrame:
@@ -584,8 +583,8 @@ if run:
                 # ── Ticker strip: headline (t+3) read per asset ──
                 ticker_items = "".join(
                     f'<div class="ticker-item"><span class="ticker-symbol">{meta["symbol"]}</span>'
-                    f'<span class="ticker-value {direction_class(results[f"{meta["symbol"]}_t+3"])}">'
-                    f'{arrow(results[f"{meta["symbol"]}_t+3"])} {fmt_pct(results[f"{meta["symbol"]}_t+3"])}</span>'
+                    f'<span class="ticker-value {direction_class(results[f"{meta["symbol"]}_t+3"]["pred"])}">'
+                    f'{arrow(results[f"{meta["symbol"]}_t+3"]["pred"])} {fmt_pct(results[f"{meta["symbol"]}_t+3"]["pred"])}</span>'
                     f'<span class="ticker-horizon">t+3</span></div>'
                     for meta in ASSETS.values()
                 )
@@ -595,8 +594,8 @@ if run:
                 rows = "".join(
                     f'<tr><td class="asset">{meta["label"]} · {meta["symbol"]}</td>'
                     + "".join(
-                        f'<td class="{direction_class(results[f"{meta["symbol"]}_{h}"])}">'
-                        f'{arrow(results[f"{meta["symbol"]}_{h}"])} {fmt_pct(results[f"{meta["symbol"]}_{h}"])}</td>'
+                        f'<td class="{direction_class(results[f"{meta["symbol"]}_{h}"]["pred"])}">'
+                        f'{arrow(results[f"{meta["symbol"]}_{h}"]["pred"])} {fmt_pct(results[f"{meta["symbol"]}_{h}"]["pred"])}</td>'
                         for h in HORIZONS
                     )
                     + "</tr>"
@@ -618,11 +617,13 @@ if run:
                 with st.expander("Raw prediction values"):
                     raw_rows = "".join(
                         f'<tr><td class="asset">{k}</td>'
-                        f'<td class="{direction_class(v)}">{arrow(v)} {v:.6f}</td></tr>'
+                        f'<td class="{direction_class(v["pred"])}">{arrow(v["pred"])} {v["pred"]:.6f}</td>'
+                        f'<td>{v["up_probability"]:.3f}</td></tr>'
                         for k, v in results.items()
                     )
                     st.markdown(
-                        f'<table class="blotter"><thead><tr><th>Target</th><th>Predicted return</th></tr></thead>'
+                        f'<table class="blotter"><thead><tr><th>Target</th><th>Predicted return</th>'
+                        f'<th>Up probability</th></tr></thead>'
                         f'<tbody>{raw_rows}</tbody></table>',
                         unsafe_allow_html=True,
                     )
