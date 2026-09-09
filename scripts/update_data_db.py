@@ -68,8 +68,7 @@ def log(msg: str) -> None:
 
 def fail(msg: str) -> None:
     log(f"VALIDATION FAILED: {msg}")
-    sys.exit(1)
-
+    sys.exit(msg)
 
 # ---------------------------------------------------------------------------
 # Database helpers
