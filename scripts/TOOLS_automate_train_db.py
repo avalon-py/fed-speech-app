@@ -401,7 +401,7 @@ def write_github_output(promoted: bool):
 def main():
     conn = psycopg2.connect(DB_URL)
     register_vector(conn)
-    run_id, started_at = start_run(conn, "trainer")
+    run_id = start_run(conn, "trainer")
 
     try:
         print("Building dataset...")
