@@ -281,20 +281,23 @@ def validate_prices(df: pd.DataFrame, today: pd.Timestamp) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+from pipeline_logging import start_run, finish_run  # add near the top, with the other imports
+
+
 def main() -> None:
     today = pd.Timestamp(datetime.now(timezone.utc).date())
     log(f"run date (UTC): {today.date()}")
 
     conn = psycopg2.connect(DB_URL)
-    conn.autocommit = False  # both upserts commit together, or neither does
+    conn.autocommit = False
+    run_id = start_run(conn, "market_data_updater")
+
     try:
         macro_last = get_last_date(conn, "macro_indicators")
         price_last = get_last_date(conn, "price_action")
         log(f"last recorded macro date: {macro_last.date() if macro_last is not None else 'none (bootstrap)'}")
         log(f"last recorded price date: {price_last.date() if price_last is not None else 'none (bootstrap)'}")
 
-        # Fetch and validate BOTH before writing either — mirrors the old
-        # "only atomic_write if both pass" guarantee from the CSV version.
         macro_fresh = fetch_macro(today, macro_last)
         validate_macro(macro_fresh, today)
 
@@ -307,11 +310,26 @@ def main() -> None:
         conn.commit()
         log("done — both tables committed together.")
 
-    except SystemExit:
+        finish_run(
+            conn, run_id, status="success",
+            rows_processed=len(macro_fresh) + len(price_fresh),
+            message=f"Upserted {len(macro_fresh)} macro row(s), {len(price_fresh)} price row(s)",
+            details={
+                "macro_rows": len(macro_fresh),
+                "price_rows": len(price_fresh),
+                "macro_last_date": str(macro_fresh["date"].max()),
+                "price_last_date": str(price_fresh["date"].max()),
+            },
+        )
+
+    except SystemExit as e:
         conn.rollback()
+        error_msg = str(e.code) if e.code else "validation failed (no message)"
+        finish_run(conn, run_id, status="failed", error_message=error_msg)
         raise
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        finish_run(conn, run_id, status="failed", error_message=str(e))
         raise
     finally:
         conn.close()
