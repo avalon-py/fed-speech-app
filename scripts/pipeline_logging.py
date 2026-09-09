@@ -1,13 +1,16 @@
-# pipeline_logging.py
+"""
+Shared Supabase logging helper for the scraper, embedder, and (future)
+trainer jobs. Each job calls start_run() once at the top of main(), and
+finish_run() exactly once before it exits — whether it succeeded, found
+nothing to do, or failed.
+"""
+
+import json
 import os
 from datetime import datetime, timezone
 
-import psycopg2
-
 
 def start_run(conn, job_name: str) -> int:
-    """Insert a 'running' row at the start of a job. Returns the row id
-    so the same script can update it when it finishes."""
     github_run_url = None
     repo = os.environ.get("GITHUB_REPOSITORY")
     run_id = os.environ.get("GITHUB_RUN_ID")
@@ -23,14 +26,13 @@ def start_run(conn, job_name: str) -> int:
             """,
             (job_name, datetime.now(timezone.utc), github_run_url),
         )
-        (run_id,) = cur.fetchone()
+        (new_id,) = cur.fetchone()
     conn.commit()
-    return run_id
+    return new_id
 
 
 def finish_run(conn, run_id: int, status: str, rows_processed: int = 0,
                 message: str = None, error_message: str = None, details: dict = None):
-    import json
     with conn.cursor() as cur:
         cur.execute(
             """
