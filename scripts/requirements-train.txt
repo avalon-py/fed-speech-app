@@ -3,7 +3,5 @@ pgvector
 pandas
 numpy
 scikit-learn
-optuna
 joblib
 python-dateutil
-supabase
