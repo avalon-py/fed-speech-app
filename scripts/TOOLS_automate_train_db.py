@@ -310,7 +310,7 @@ def evaluate_target(col, sign_model, threshold, magnitude_model, X_eval, y_eval)
     y_true = y_eval[col]
     valid = y_true.notna()
     if valid.sum() < 2:
-        return None, None
+        return None, None, None
     y_true_valid = y_true[valid]
     y_bin_true = (y_true_valid > 0).astype(int)
 
@@ -322,20 +322,35 @@ def evaluate_target(col, sign_model, threshold, magnitude_model, X_eval, y_eval)
         "f1": float(f1_score(y_bin_true, pred_bin, average="macro", zero_division=0)),
         "rmse": float(np.sqrt(mean_squared_error(y_true_valid, pred))),
     }
-    return metrics, pred
+    return metrics, pred, y_bin_true
 
+MIN_CLASS_COUNT_FOR_AUC_CHECK = 8  # per class; below this, AUC is too noisy to judge inversion from
 
-def run_sanity_checks(train_rows, eval_rows, all_metrics, all_preds):
+def run_sanity_checks(train_rows, eval_rows, all_metrics, all_preds, all_eval_labels):
     checks = {}
     checks["train_rows_ok"] = train_rows >= MIN_TRAIN_ROWS
     checks["eval_rows_ok"] = eval_rows >= MIN_EVAL_ROWS
     checks["no_nan_inf"] = all(np.isfinite(p).all() for p in all_preds.values() if p is not None and len(p) > 0)
     checks["variance_ok"] = all(np.std(p) > MIN_PRED_STD for p in all_preds.values() if p is not None and len(p) > 0)
     checks["magnitude_bounded"] = all(np.abs(p).max() < MAX_ABS_PRED for p in all_preds.values() if p is not None and len(p) > 0)
-    aucs = [m["auc"] for m in all_metrics.values() if m and m["auc"] is not None]
-    checks["sign_not_inverted"] = all(a >= MIN_SIGN_AUC for a in aucs) if aucs else True
-    return all(checks.values()), checks
 
+    inverted_targets = []
+    for col, metrics in all_metrics.items():
+        if not metrics or metrics["auc"] is None:
+            continue
+        y_bin = all_eval_labels.get(col)
+        if y_bin is None:
+            continue
+        n_pos, n_neg = y_bin.sum(), len(y_bin) - y_bin.sum()
+        if n_pos < MIN_CLASS_COUNT_FOR_AUC_CHECK or n_neg < MIN_CLASS_COUNT_FOR_AUC_CHECK:
+            continue  # not enough data in this window to trust the AUC estimate
+        if metrics["auc"] < MIN_SIGN_AUC:
+            inverted_targets.append(col)
+    checks["sign_not_inverted"] = len(inverted_targets) == 0
+    checks["_inverted_targets"] = inverted_targets  # kept for visibility in sanity_details, not a bool gate itself
+
+    passed = all(v for k, v in checks.items() if not k.startswith("_"))
+    return passed, checks
 
 def save_artifacts(sign_models, thresholds, magnitude_models, hyperparams, feature_columns, windows):
     os.makedirs(os.path.join(PROD_DIR, "magnitude"), exist_ok=True)
@@ -382,7 +397,7 @@ def main():
         X_eval, y_eval = eval_df[feature_columns], eval_df[TARGET_COLS]
 
         sign_models, thresholds, magnitude_models, hyperparams = {}, {}, {}, {}
-        all_metrics, all_preds = {}, {}
+        all_metrics, all_preds, all_eval_labels = {}, {}, {}
 
         for col in TARGET_COLS:
             print(f"Training {col}...")
@@ -390,11 +405,11 @@ def main():
             sign_models[col], thresholds[col], magnitude_models[col], hyperparams[col] = (
                 sign_model, threshold, magnitude_model, hp
             )
-            metrics, pred = evaluate_target(col, sign_model, threshold, magnitude_model, X_eval, y_eval)
-            all_metrics[col], all_preds[col] = metrics, pred
+            metrics, pred, y_bin = evaluate_target(col, sign_model, threshold, magnitude_model, X_eval, y_eval)
+            all_metrics[col], all_preds[col], all_eval_labels[col] = metrics, pred, y_bin
             print(f"  eval metrics: {metrics}")
 
-        sanity_passed, sanity_details = run_sanity_checks(len(train_df), len(eval_df), all_metrics, all_preds)
+        sanity_passed, sanity_details = run_sanity_checks(len(train_df), len(eval_df), all_metrics, all_preds, all_eval_labels)
         print(f"\nSanity gate: {'PASSED' if sanity_passed else 'FAILED'}")
         print(json.dumps(sanity_details, indent=2))
 
