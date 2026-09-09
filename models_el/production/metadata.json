@@ -1,10 +1,9 @@
 {
-  "trained_at": "2026-09-09T03:21:08.722423+00:00",
-  "split_date": "2023-01-01",
+  "trained_at": "2026-09-09T13:33:58.280691+00:00",
   "train_start": "1996-06-13",
-  "train_end": "2022-12-01",
-  "test_start": "2023-01-06",
-  "test_end": "2025-12-15",
+  "train_end": "2026-03-11",
+  "eval_start": "2026-04-10",
+  "eval_end": "2026-08-10",
   "targets": [
     "SPX_t+3",
     "SPX_t+7",
@@ -18,5 +17,6 @@
     "TNX_t+3",
     "TNX_t+7",
     "TNX_t+30"
-  ]
+  ],
+  "hyperparam_source": "optuna_2026-09-09"
 }
