@@ -4,38 +4,24 @@ Fed Speech Model Trainer — Rolling-Window Continuous Training (Postgres)
 ===========================================================================
 
 Runs monthly. Retrains the two-stage sign+magnitude stack on a rolling
-window of history, evaluates on a trailing, fully-realized eval window,
-and promotes the new model unconditionally IF it passes a cheap sanity
-gate (not a performance-margin gate — recency is preferred by design,
-sanity just catches pipeline breakage).
+window of history using FIXED, per-target hyperparameters (sourced from
+a one-time Optuna search run on 2026-09-09 — see HYPERPARAM_SOURCE below),
+evaluates on a trailing, fully-realized eval window, and promotes the new
+model unconditionally IF it passes a cheap sanity gate.
 
-NOTE ON HYPERPARAMETERS: this script does NOT run Optuna. Re-tuning on
-every rolling window adds selection variance without adding signal (a
-metric swing becomes unclear: did the market change, or did the search
-just land somewhere different this time?) — and it's the entire reason
-this job used to take ~1hr, most of which was Optuna, not actual
-training. Hyperparameter tuning is a separate, lower-frequency concern
-(quarterly/semi-annually), meant to live in its own script. Until that
-script exists, get_hyperparams() below returns fixed, hand-picked
-defaults derived from the ranges the original notebook's Optuna search
-converged around. When the tuner script exists, swap get_hyperparams()
-to read from wherever it writes its output (a JSON file, a DB table,
-etc.) — nothing else in this script needs to change.
+No Optuna runs here. Re-tuning on every rolling window adds selection
+variance without adding signal. Hyperparameter search is a separate,
+lower-frequency concern (quarterly/semi-annually) — when that script
+exists, swap HYPERPARAMS below to read from wherever it writes output.
 
 Windowing:
-  - eval_end   = today - MAX_HORIZON days        (last date with a fully
-                                                    realized t+30 label)
+  - eval_end   = today - MAX_HORIZON days
   - eval_start = eval_end - EVAL_WINDOW_MONTHS
-  - train_end  = eval_start - MAX_HORIZON days    (purge gap, so no
-                                                    training example's
-                                                    label window bleeds
-                                                    into the eval window)
+  - train_end  = eval_start - MAX_HORIZON days    (purge gap)
   - train_start = earliest available speech date
 
-Requires DB_URL, SUPABASE_URL, SUPABASE_KEY. Writes model artifacts to
-models_el/production/ locally; the calling workflow is responsible for
-committing/pushing them if this script reports promoted=true via
-GITHUB_OUTPUT.
+Requires only DB_URL — price_action/macro_indicators are read once each
+via psycopg2, no REST/Supabase-client round trip needed.
 """
 
 import json
@@ -56,14 +42,9 @@ from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Path setup — features.py/db.py live at repo root, this script is in scripts/
-# ---------------------------------------------------------------------------
-
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from features import _engineer_price_features, _engineer_macro_features  # noqa: E402
 from pipeline_logging import start_run, finish_run, log_training_detail  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -72,52 +53,72 @@ from pipeline_logging import start_run, finish_run, log_training_detail  # noqa:
 
 DB_URL = os.environ["DB_URL"]
 PROD_DIR = os.path.join(REPO_ROOT, "models_el", "production")
+HYPERPARAM_SOURCE = "optuna_2026-09-09"  # bump this string whenever HYPERPARAMS below changes
 
-TARGET_ASSETS = ["SPX", "GOLD", "VIX", "TNX"]  # DXY is a feature only, never a target
+TARGET_ASSETS = ["SPX", "GOLD", "VIX", "TNX"]
 HORIZONS = [3, 7, 30]
 TARGET_COLS = [f"{a}_t+{h}" for a in TARGET_ASSETS for h in HORIZONS]
 
 MAX_HORIZON = 30
 EVAL_WINDOW_MONTHS = 4
 
-# Sanity-gate thresholds — deliberately loose. This is "not obviously
-# broken," not "good."
 MIN_TRAIN_ROWS = 200
 MIN_EVAL_ROWS = 10
 MIN_PRED_STD = 1e-6
 MAX_ABS_PRED = 5.0
 MIN_SIGN_AUC = 0.30
 
+_COMMON_REG = {"max_bins": 255, "early_stopping": True, "n_iter_no_change": 50,
+               "validation_fraction": 0.15, "random_state": 42}
+_COMMON_CLF = {"max_bins": 255, "early_stopping": True, "n_iter_no_change": 30,
+               "validation_fraction": 0.15, "random_state": 42}
 
 # ---------------------------------------------------------------------------
-# Fixed hyperparameters (no Optuna) — see module docstring.
+# Fixed hyperparameters — per target, sourced from the 2026-09-09 Optuna run.
 # ---------------------------------------------------------------------------
 
-def get_magnitude_hyperparams(asset: str) -> dict:
-    if asset in ("SPX", "VIX"):
-        base = dict(max_depth=3, max_leaf_nodes=18, min_samples_leaf=55,
-                    l2_regularization=4.0, learning_rate=0.01, max_iter=1000)
-    elif asset == "GOLD":
-        base = dict(max_depth=2, max_leaf_nodes=14, min_samples_leaf=75,
-                    l2_regularization=6.0, learning_rate=0.01, max_iter=1000)
-    else:  # TNX
-        base = dict(max_depth=2, max_leaf_nodes=10, min_samples_leaf=90,
-                    l2_regularization=7.0, learning_rate=0.01, max_iter=1000)
-    return {**base, "max_bins": 255, "early_stopping": True,
-            "n_iter_no_change": 50, "validation_fraction": 0.15, "random_state": 42}
+MAGNITUDE_HYPERPARAMS = {
+    "SPX_t+3":   dict(max_depth=4, max_leaf_nodes=16, min_samples_leaf=30, l2_regularization=3.216738316130575,  learning_rate=0.014646107545610718, max_iter=500),
+    "SPX_t+7":   dict(max_depth=3, max_leaf_nodes=14, min_samples_leaf=79, l2_regularization=5.857421224796318,  learning_rate=0.018390973937871168, max_iter=1400),
+    "SPX_t+30":  dict(max_depth=4, max_leaf_nodes=19, min_samples_leaf=32, l2_regularization=3.229671632403372,  learning_rate=0.010189702162220416, max_iter=1200),
+    "GOLD_t+3":  dict(max_depth=3, max_leaf_nodes=18, min_samples_leaf=54, l2_regularization=4.786845531508995,  learning_rate=0.00525471184201688,  max_iter=800),
+    "GOLD_t+7":  dict(max_depth=3, max_leaf_nodes=13, min_samples_leaf=50, l2_regularization=4.019334453111255,  learning_rate=0.012586039096052513, max_iter=1200),
+    "GOLD_t+30": dict(max_depth=3, max_leaf_nodes=13, min_samples_leaf=50, l2_regularization=4.02800842868932,   learning_rate=0.008186223091364419, max_iter=700),
+    "VIX_t+3":   dict(max_depth=2, max_leaf_nodes=22, min_samples_leaf=41, l2_regularization=3.1848016110574657, learning_rate=0.014949151633306557, max_iter=500),
+    "VIX_t+7":   dict(max_depth=2, max_leaf_nodes=22, min_samples_leaf=52, l2_regularization=5.863592359181043,  learning_rate=0.010741400147472746, max_iter=1200),
+    "VIX_t+30":  dict(max_depth=3, max_leaf_nodes=20, min_samples_leaf=55, l2_regularization=2.951505217315425,  learning_rate=0.007061034117895645, max_iter=700),
+    # TNX's search space fixed max_depth=2, max_leaf_nodes=10, learning_rate=0.01 — only min_samples_leaf/l2/max_iter were searched
+    "TNX_t+3":   dict(max_depth=2, max_leaf_nodes=10, min_samples_leaf=115, l2_regularization=6.900724559253215, learning_rate=0.01, max_iter=800),
+    "TNX_t+7":   dict(max_depth=2, max_leaf_nodes=10, min_samples_leaf=95,  l2_regularization=7.1212502249818534, learning_rate=0.01, max_iter=700),
+    "TNX_t+30":  dict(max_depth=2, max_leaf_nodes=10, min_samples_leaf=80,  l2_regularization=6.953785098568782, learning_rate=0.01, max_iter=1300),
+}
+
+SIGN_HYPERPARAMS = {
+    "SPX_t+3":   dict(max_iter=200, learning_rate=0.06697167353375243, max_depth=4, max_leaf_nodes=24, min_samples_leaf=21, l2_regularization=7.579479953348009),
+    "SPX_t+7":   dict(max_iter=500, learning_rate=0.0947416943676608,  max_depth=2, max_leaf_nodes=15, min_samples_leaf=55, l2_regularization=0.004346338963924681),
+    "SPX_t+30":  dict(max_iter=400, learning_rate=0.0862735828664018,  max_depth=4, max_leaf_nodes=22, min_samples_leaf=32, l2_regularization=0.004207053950287938),
+    "GOLD_t+3":  dict(max_iter=400, learning_rate=0.0862735828664018,  max_depth=4, max_leaf_nodes=22, min_samples_leaf=32, l2_regularization=0.004207053950287938),
+    "GOLD_t+7":  dict(max_iter=600, learning_rate=0.0340553900090262,  max_depth=3, max_leaf_nodes=15, min_samples_leaf=25, l2_regularization=0.25003876953319126),
+    "GOLD_t+30": dict(max_iter=800, learning_rate=0.01774767828860134, max_depth=3, max_leaf_nodes=31, min_samples_leaf=88, l2_regularization=0.5895953702873469),
+    "VIX_t+3":   dict(max_iter=400, learning_rate=0.0862735828664018,  max_depth=4, max_leaf_nodes=22, min_samples_leaf=32, l2_regularization=0.004207053950287938),
+    "VIX_t+7":   dict(max_iter=300, learning_rate=0.04359848050541604, max_depth=3, max_leaf_nodes=27, min_samples_leaf=66, l2_regularization=9.590428665924259),
+    "VIX_t+30":  dict(max_iter=200, learning_rate=0.06697167353375243, max_depth=4, max_leaf_nodes=24, min_samples_leaf=21, l2_regularization=7.579479953348009),
+    "TNX_t+3":   dict(max_iter=650, learning_rate=0.09013710971500906, max_depth=4, max_leaf_nodes=21, min_samples_leaf=22, l2_regularization=0.4026351853278354),
+    "TNX_t+7":   dict(max_iter=200, learning_rate=0.07621195864233186, max_depth=3, max_leaf_nodes=23, min_samples_leaf=45, l2_regularization=0.12030178871154672),
+    "TNX_t+30":  dict(max_iter=650, learning_rate=0.02229573198727992, max_depth=3, max_leaf_nodes=8,  min_samples_leaf=60, l2_regularization=0.03743859414648188),
+}
 
 
-def get_sign_hyperparams(asset: str) -> dict:
-    # Classifier search space in the notebook wasn't asset-differentiated
-    # (unlike the regressor), so one fixed profile covers all four assets.
-    base = dict(max_iter=500, learning_rate=0.03, max_depth=3,
-                max_leaf_nodes=20, min_samples_leaf=50, l2_regularization=1.0)
-    return {**base, "max_bins": 255, "early_stopping": True,
-            "n_iter_no_change": 30, "validation_fraction": 0.15, "random_state": 42}
+def get_magnitude_hyperparams(col: str) -> dict:
+    return {**MAGNITUDE_HYPERPARAMS[col], **_COMMON_REG}
+
+
+def get_sign_hyperparams(col: str) -> dict:
+    return {**SIGN_HYPERPARAMS[col], **_COMMON_CLF}
 
 
 # ---------------------------------------------------------------------------
-# Dataset assembly
+# Dataset assembly — all three tables fetched exactly once, via psycopg2 only
 # ---------------------------------------------------------------------------
 
 def get_weight(speaker: str) -> float:
@@ -152,6 +153,15 @@ def fetch_raw_prices(conn) -> pd.DataFrame:
     return df
 
 
+def fetch_raw_macro(conn) -> pd.DataFrame:
+    with conn.cursor() as cur:
+        cur.execute("SELECT date, unemployment, interest_rate, growth_rate FROM macro_indicators ORDER BY date")
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=["date", "unemployment", "interest_rate", "growth_rate"])
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
 def compute_targets(prices: pd.DataFrame) -> pd.DataFrame:
     out = prices[["date"]].copy()
     for col in TARGET_ASSETS:
@@ -160,59 +170,7 @@ def compute_targets(prices: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _vector_to_array(v) -> np.ndarray:
-    """pgvector's Vector wrapper (from register_vector) doesn't auto-convert
-    via np.asarray the way a plain list/ndarray does — needs explicit
-    unpacking via .to_list() first."""
-    if hasattr(v, "to_list"):
-        return np.asarray(v.to_list(), dtype=np.float32)
-    return np.asarray(v, dtype=np.float32)
-
-
-def build_dataset(conn) -> pd.DataFrame:
-    speeches = fetch_speeches_with_embeddings(conn)
-    if speeches.empty:
-        raise RuntimeError("fed_speech has no embedded rows — nothing to train on.")
-
-    raw_prices = fetch_raw_prices(conn)               # ← single fetch of price_action
-    price_engineered = _engineer_price_features_local(raw_prices)   # ← computed locally, no re-fetch
-    macro_engineered = _engineer_macro_features_local(conn)
-    targets = compute_targets(raw_prices)              # ← reuses the SAME fetch
-
-    merged = price_engineered.merge(macro_engineered, on="date", how="inner")
-    merged = merged.merge(targets, on="date", how="left")
-    df = speeches.merge(merged, on="date", how="left")
-    df["sample_weight"] = df["speaker"].apply(get_weight)
-
-    emb_matrix = np.vstack(df["embedding"].apply(_vector_to_array).values)
-    assert emb_matrix.ndim == 2 and emb_matrix.shape[1] > 1, (
-        f"Embedding matrix has unexpected shape {emb_matrix.shape}"
-    )
-    emb_df = pd.DataFrame(emb_matrix, index=df.index, columns=[f"emb_{i}" for i in range(emb_matrix.shape[1])])
-    df = pd.concat([df.drop(columns=["embedding"]), emb_df], axis=1)
-
-    return df.sort_values("date").reset_index(drop=True)
-
-def purged_split(df: pd.DataFrame):
-    today = datetime.now(timezone.utc).date()
-    eval_end = today - timedelta(days=MAX_HORIZON)
-    eval_start = eval_end - relativedelta(months=EVAL_WINDOW_MONTHS)
-    train_end = eval_start - timedelta(days=MAX_HORIZON)
-    train_start = df["date"].min().date()
-
-    train_df = df[(df["date"].dt.date >= train_start) & (df["date"].dt.date <= train_end)]
-    eval_df = df[(df["date"].dt.date >= eval_start) & (df["date"].dt.date <= eval_end)]
-
-    windows = {
-        "train_start": train_start, "train_end": train_end,
-        "eval_start": eval_start, "eval_end": eval_end,
-    }
-    return train_df, eval_df, windows
-
-def _engineer_price_features_local(raw_prices: pd.DataFrame) -> pd.DataFrame:
-    """Same feature logic as features.py's _engineer_price_features, but
-    computed from an already-fetched DataFrame instead of making its own
-    REST call — avoids double-fetching price_action."""
+def engineer_price_features(raw_prices: pd.DataFrame) -> pd.DataFrame:
     prices = raw_prices.copy()
     engineered_cols = ["date"]
     for col in ["SPX", "GOLD", "TNX", "DXY", "VIX"]:
@@ -231,27 +189,64 @@ def _engineer_price_features_local(raw_prices: pd.DataFrame) -> pd.DataFrame:
     return prices[engineered_cols]
 
 
-def _engineer_macro_features_local(conn) -> pd.DataFrame:
-    """Same as features.py's _engineer_macro_features, but via psycopg2
-    directly instead of REST."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT date, unemployment, interest_rate, growth_rate FROM macro_indicators ORDER BY date")
-        rows = cur.fetchall()
-    macro = pd.DataFrame(rows, columns=["date", "unemployment", "interest_rate", "growth_rate"])
-    macro["date"] = pd.to_datetime(macro["date"])
-    macro = macro.set_index("date").sort_index()
-
+def engineer_macro_features(raw_macro: pd.DataFrame) -> pd.DataFrame:
+    macro = raw_macro.set_index("date").sort_index()
     for col in ["unemployment", "growth_rate"]:
         macro[col] = macro[col].shift(30)
-
     daily_index = pd.date_range(start=macro.index.min(), end=macro.index.max(), freq="D")
     macro_daily = macro.reindex(daily_index).ffill().reset_index().rename(columns={"index": "date"})
     return macro_daily[["date", "unemployment", "interest_rate", "growth_rate"]]
 
+
+def _vector_to_array(v) -> np.ndarray:
+    if hasattr(v, "to_list"):
+        return np.asarray(v.to_list(), dtype=np.float32)
+    return np.asarray(v, dtype=np.float32)
+
+
+def build_dataset(conn) -> pd.DataFrame:
+    speeches = fetch_speeches_with_embeddings(conn)
+    if speeches.empty:
+        raise RuntimeError("fed_speech has no embedded rows — nothing to train on.")
+
+    raw_prices = fetch_raw_prices(conn)          # fetched once
+    raw_macro = fetch_raw_macro(conn)             # fetched once
+    price_engineered = engineer_price_features(raw_prices)
+    macro_engineered = engineer_macro_features(raw_macro)
+    targets = compute_targets(raw_prices)          # reuses the same raw_prices fetch
+
+    merged = price_engineered.merge(macro_engineered, on="date", how="inner")
+    merged = merged.merge(targets, on="date", how="left")
+    df = speeches.merge(merged, on="date", how="left")
+    df["sample_weight"] = df["speaker"].apply(get_weight)
+
+    emb_matrix = np.vstack(df["embedding"].apply(_vector_to_array).values)
+    assert emb_matrix.ndim == 2 and emb_matrix.shape[1] > 1, (
+        f"Embedding matrix has unexpected shape {emb_matrix.shape}"
+    )
+    emb_df = pd.DataFrame(emb_matrix, index=df.index, columns=[f"emb_{i}" for i in range(emb_matrix.shape[1])])
+    df = pd.concat([df.drop(columns=["embedding"]), emb_df], axis=1)
+
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def purged_split(df: pd.DataFrame):
+    today = datetime.now(timezone.utc).date()
+    eval_end = today - timedelta(days=MAX_HORIZON)
+    eval_start = eval_end - relativedelta(months=EVAL_WINDOW_MONTHS)
+    train_end = eval_start - timedelta(days=MAX_HORIZON)
+    train_start = df["date"].min().date()
+
+    train_df = df[(df["date"].dt.date >= train_start) & (df["date"].dt.date <= train_end)]
+    eval_df = df[(df["date"].dt.date >= eval_start) & (df["date"].dt.date <= eval_end)]
+
+    windows = {"train_start": train_start, "train_end": train_end,
+               "eval_start": eval_start, "eval_end": eval_end}
+    return train_df, eval_df, windows
+
+
 # ---------------------------------------------------------------------------
-# Modeling — plain fit, no search. Sign classifier's threshold is still
-# derived from purged out-of-fold predictions (that's a data-driven
-# calibration step, not a hyperparameter search, so it stays).
+# Modeling — plain fit with fixed per-target hyperparams
 # ---------------------------------------------------------------------------
 
 def get_class_weight_multiplier(y_bin, neg_boost=1.0):
@@ -264,27 +259,21 @@ def get_class_weight_multiplier(y_bin, neg_boost=1.0):
 
 
 def train_target(col, X_train, y_train, w_train):
-    asset = col.split("_")[0]
     horizon = int(col.split("+")[1])
 
     y_col = y_train[col]
     valid = y_col.notna()
     X_full, y_full, w_full = X_train[valid], y_col[valid], w_train[valid]
 
-    # ── magnitude regressor — plain fit, fixed hyperparams ──
-    reg_params = get_magnitude_hyperparams(asset)
+    reg_params = get_magnitude_hyperparams(col)
     magnitude_model = HistGradientBoostingRegressor(**reg_params)
     magnitude_model.fit(X_full, y_full, sample_weight=w_full)
 
-    # ── sign classifier — plain fit, fixed hyperparams ──
-    clf_params = get_sign_hyperparams(asset)
+    clf_params = get_sign_hyperparams(col)
     y_bin_full = (y_full > 0).astype(int).values
     class_w = get_class_weight_multiplier(y_bin_full)
     w_clf_full = w_full.values * class_w
 
-    # OOF threshold selection — still purged, still needed: the decision
-    # cutoff is calibration on THIS window's data, not a hyperparameter
-    # search over model architecture.
     tscv = TimeSeriesSplit(n_splits=5)
     oof_proba, oof_true = [], []
     for tr_idx, val_idx in tscv.split(X_full):
@@ -336,55 +325,34 @@ def evaluate_target(col, sign_model, threshold, magnitude_model, X_eval, y_eval)
     return metrics, pred
 
 
-# ---------------------------------------------------------------------------
-# Sanity gate — cheap "not obviously broken" checks, NOT a performance gate.
-# ---------------------------------------------------------------------------
-
 def run_sanity_checks(train_rows, eval_rows, all_metrics, all_preds):
     checks = {}
     checks["train_rows_ok"] = train_rows >= MIN_TRAIN_ROWS
     checks["eval_rows_ok"] = eval_rows >= MIN_EVAL_ROWS
-    checks["no_nan_inf"] = all(
-        np.isfinite(p).all() for p in all_preds.values() if p is not None and len(p) > 0
-    )
-    checks["variance_ok"] = all(
-        np.std(p) > MIN_PRED_STD for p in all_preds.values() if p is not None and len(p) > 0
-    )
-    checks["magnitude_bounded"] = all(
-        np.abs(p).max() < MAX_ABS_PRED for p in all_preds.values() if p is not None and len(p) > 0
-    )
+    checks["no_nan_inf"] = all(np.isfinite(p).all() for p in all_preds.values() if p is not None and len(p) > 0)
+    checks["variance_ok"] = all(np.std(p) > MIN_PRED_STD for p in all_preds.values() if p is not None and len(p) > 0)
+    checks["magnitude_bounded"] = all(np.abs(p).max() < MAX_ABS_PRED for p in all_preds.values() if p is not None and len(p) > 0)
     aucs = [m["auc"] for m in all_metrics.values() if m and m["auc"] is not None]
     checks["sign_not_inverted"] = all(a >= MIN_SIGN_AUC for a in aucs) if aucs else True
-
-    passed = all(checks.values())
-    return passed, checks
+    return all(checks.values()), checks
 
 
-# ---------------------------------------------------------------------------
-# Save artifacts
-# ---------------------------------------------------------------------------
-
-def save_artifacts(sign_models, thresholds, magnitude_models, hyperparams,
-                    feature_columns, windows):
+def save_artifacts(sign_models, thresholds, magnitude_models, hyperparams, feature_columns, windows):
     os.makedirs(os.path.join(PROD_DIR, "magnitude"), exist_ok=True)
     os.makedirs(os.path.join(PROD_DIR, "sign"), exist_ok=True)
-
     for col, model in magnitude_models.items():
         joblib.dump(model, os.path.join(PROD_DIR, "magnitude", f"{col}.pkl"))
     for col, model in sign_models.items():
         joblib.dump(model, os.path.join(PROD_DIR, "sign", f"{col}.pkl"))
-
     with open(os.path.join(PROD_DIR, "thresholds.json"), "w") as f:
         json.dump(thresholds, f, indent=2)
-
     joblib.dump(feature_columns, os.path.join(PROD_DIR, "feature_columns.pkl"))
-
     with open(os.path.join(PROD_DIR, "metadata.json"), "w") as f:
         json.dump({
             "trained_at": datetime.now(timezone.utc).isoformat(),
             **{k: str(v) for k, v in windows.items()},
             "targets": TARGET_COLS,
-            "hyperparam_source": "fixed_defaults",  # flips to "tuner" once that script exists
+            "hyperparam_source": HYPERPARAM_SOURCE,
         }, f, indent=2)
 
 
@@ -394,10 +362,6 @@ def write_github_output(promoted: bool):
         with open(output_path, "a") as f:
             f.write(f"promoted={'true' if promoted else 'false'}\n")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     conn = psycopg2.connect(DB_URL)
