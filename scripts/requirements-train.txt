@@ -1,0 +1,8 @@
+psycopg2-binary
+pgvector
+pandas
+numpy
+scikit-learn
+optuna
+joblib
+python-dateutil
