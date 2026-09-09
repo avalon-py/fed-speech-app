@@ -45,3 +45,25 @@ def finish_run(conn, run_id: int, status: str, rows_processed: int = 0,
              message, error_message, json.dumps(details) if details else None, run_id),
         )
     conn.commit()
+
+
+def log_training_detail(conn, pipeline_run_id: int, train_start=None, train_end=None,
+                         eval_start=None, eval_end=None, metrics: dict = None,
+                         hyperparams: dict = None, sanity_passed: bool = None,
+                         sanity_details: dict = None, promoted: bool = None,
+                         git_commit: str = None):
+    """Call once, only from the trainer job, AFTER finish_run() has already
+    updated the pipeline_runs header row for this run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO training_run_detail
+               (pipeline_run_id, train_start, train_end, eval_start, eval_end,
+                metrics, hyperparams, sanity_passed, sanity_details, promoted, git_commit)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (pipeline_run_id, train_start, train_end, eval_start, eval_end,
+             json.dumps(metrics) if metrics else None,
+             json.dumps(hyperparams) if hyperparams else None,
+             sanity_passed, json.dumps(sanity_details) if sanity_details else None,
+             promoted, git_commit),
+        )
+    conn.commit()
