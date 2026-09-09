@@ -29,6 +29,7 @@ import sys
 import time
 from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree
+from pipeline_logging import start_run, finish_run
 
 import psycopg2
 import requests
@@ -209,12 +210,14 @@ def insert_row(conn, row: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"Fetching speech feed: {RSS_URL}")
-    feed_items = fetch_speech_links_from_rss(RSS_URL)
-    print(f"Feed contains {len(feed_items)} entries")
-
     conn = psycopg2.connect(DB_URL)
+    run_id = start_run(conn, "scraper")
+
     try:
+        print(f"Fetching speech feed: {RSS_URL}")
+        feed_items = fetch_speech_links_from_rss(RSS_URL)
+        print(f"Feed contains {len(feed_items)} entries")
+
         last_date = get_last_date(conn)
         if last_date:
             print(f"Most recent date already in DB: {last_date.isoformat()}")
@@ -231,16 +234,10 @@ def main():
 
         if not new_items:
             print("No new speeches found. Nothing to do.")
+            finish_run(conn, run_id, status="success", rows_processed=0,
+                       message="Nothing to do.")
             return
 
-        # The RSS feed lists items newest-first. Since 'id' is a Postgres
-        # serial assigned at insert time, inserting in feed order would
-        # give the newest item the lowest id and the oldest item the
-        # highest — backwards from the chronological id ordering the
-        # backfill established. Sorting oldest-first here keeps id order
-        # consistent with date order across the whole table, batch after
-        # batch. Items with an unparseable pubDate sort last within the
-        # batch rather than crashing the sort.
         new_items.sort(key=lambda item: (parse_rss_pubdate(item["pub_date"]) is None,
                                           parse_rss_pubdate(item["pub_date"])))
 
@@ -257,8 +254,6 @@ def main():
             scraped = scrape_speech_page(link)
 
             if not scraped["ok"]:
-                # Nothing written, nothing marked seen — next run retries it,
-                # since it's still absent from the table.
                 failed_links.append(link)
                 if i < len(new_items) - 1:
                     time.sleep(REQUEST_DELAY_SECONDS)
@@ -287,6 +282,16 @@ def main():
             for link in failed_links:
                 print(f"  - {link}", file=sys.stderr)
             print("They're still absent from the table, so the next run will retry them.", file=sys.stderr)
+
+        finish_run(
+            conn, run_id, status="success", rows_processed=inserted_count,
+            message=f"Inserted {inserted_count} new speech(es)",
+            details={"failed_links": failed_links} if failed_links else None,
+        )
+
+    except Exception as e:
+        finish_run(conn, run_id, status="failed", error_message=str(e))
+        raise
 
     finally:
         conn.close()
