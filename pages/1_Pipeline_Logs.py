@@ -46,7 +46,15 @@ st.markdown(
         --line: rgba(255,255,255,0.08); --gold: #C9A227; --bull: #4E9A6B; --bear: #B84C3E;
     }
 
-    .stApp, .stApp p, .stApp label, .stApp span { font-family: 'Inter', sans-serif; }
+    /* NOTE: scoped to exclude Streamlit's own icon spans (e.g. the sidebar
+       collapse arrow, which is a material-icon ligature like
+       "keyboard_double_arrow_left" rendered as a <span>). A blanket
+       `.stApp span { font-family: Inter }` rule overrides the icon font too,
+       so the ligature name prints as literal text instead of an arrow glyph. */
+    .stApp, .stApp p, .stApp label { font-family: 'Inter', sans-serif; }
+    .stApp span:not([data-testid="stIconMaterial"]):not([class*="material-symbols"]):not([class*="material-icons"]) {
+        font-family: 'Inter', sans-serif;
+    }
     [data-testid="stHeader"] { background: transparent; height: 2.2rem; }
     .block-container { padding-top: 0.3rem !important; padding-bottom: 0.6rem !important; }
 
@@ -185,6 +193,40 @@ def status_meta(status: str) -> dict:
     return STATUS_STYLE.get(str(status).lower(), DEFAULT_STATUS_STYLE)
 
 
+def status_matches(status: str, selection: str) -> bool:
+    if selection == "All":
+        return True
+    return status_meta(status)["label"].title() == selection
+
+
+def pair_scraper_embedder(runs_df: pd.DataFrame) -> list[dict]:
+    """Embedder is triggered by GitHub Actions' workflow_run after a scraper
+    run succeeds, so there's no FK linking the two rows — approximate the
+    pairing chronologically: each scraper run pairs with the next embedder
+    run that starts after it, in order."""
+    scraper = runs_df[runs_df["job_name"] == "scraper"].sort_values("started_at").reset_index(drop=True)
+    embedder = runs_df[runs_df["job_name"] == "embedder"].sort_values("started_at").reset_index(drop=True)
+    used = set()
+    pairs = []
+    for _, s in scraper.iterrows():
+        candidates = embedder[(embedder["started_at"] > s["started_at"]) & (~embedder.index.isin(used))]
+        if not candidates.empty:
+            idx = candidates.index[0]
+            used.add(idx)
+            e = embedder.loc[idx]
+            gap = None
+            if has_value(s.get("finished_at")) and has_value(e.get("started_at")):
+                gap = (e["started_at"] - s["finished_at"]).total_seconds()
+            pairs.append({"scraper": s, "embedder": e, "gap": gap})
+        else:
+            pairs.append({"scraper": s, "embedder": None, "gap": None})
+    for idx, e in embedder.iterrows():
+        if idx not in used:
+            pairs.append({"scraper": None, "embedder": e, "gap": None})
+    pairs.sort(key=lambda p: (p["scraper"]["started_at"] if p["scraper"] is not None else p["embedder"]["started_at"]), reverse=True)
+    return pairs
+
+
 # ── Metrics / hyperparameter / sanity table builders ────────────────────────
 def metrics_table(metrics: dict) -> pd.DataFrame:
     """One row per prediction target (asset+horizon), columns = metric."""
@@ -300,58 +342,53 @@ if runs_df.empty:
     st.info("No pipeline runs logged yet.")
     st.stop()
 
-# ── Filters ──────────────────────────────────────────────────────────────
-fc1, fc2, fc3 = st.columns([1.4, 1.4, 1.6])
-with fc1:
-    job_options = sorted(runs_df["job_name"].dropna().unique().tolist())
-    job_filter = st.multiselect("Job", job_options, default=job_options, label_visibility="collapsed", placeholder="Filter by job")
-with fc2:
-    status_options = sorted(runs_df["status"].dropna().unique().tolist())
-    status_filter = st.multiselect("Status", status_options, default=status_options, label_visibility="collapsed", placeholder="Filter by status")
-with fc3:
+# ── Shared filters (apply inside whichever tab is open) ───────────────────
+ff1, ff2 = st.columns([2, 1.2])
+with ff1:
+    status_filter = st.radio(
+        "Status", ["All", "Success", "Failed", "Running"],
+        horizontal=True, label_visibility="collapsed",
+    )
+with ff2:
     lookback = st.selectbox(
         "Lookback", ["Last 24 hours", "Last 7 days", "Last 30 days", "All time"],
         index=1, label_visibility="collapsed",
     )
 
-filtered = runs_df[runs_df["job_name"].isin(job_filter) & runs_df["status"].isin(status_filter)]
-if lookback != "All time" and not filtered.empty:
+if lookback != "All time":
     hours = {"Last 24 hours": 24, "Last 7 days": 24 * 7, "Last 30 days": 24 * 30}[lookback]
-    cutoff = pd.Timestamp.now(tz=filtered["started_at"].dt.tz) - timedelta(hours=hours)
-    filtered = filtered[filtered["started_at"] >= cutoff]
+    cutoff = pd.Timestamp.now(tz=runs_df["started_at"].dt.tz) - timedelta(hours=hours)
+    runs_df = runs_df[runs_df["started_at"] >= cutoff]
 
-# ── KPI strip ────────────────────────────────────────────────────────────
-total_runs = len(filtered)
-status_lower = filtered["status"].str.lower() if total_runs else pd.Series(dtype=str)
-success_count = status_lower.isin(["success", "completed"]).sum()
-failed_count = status_lower.isin(["failed", "error"]).sum()
-running_count = status_lower.isin(["running", "in_progress", "started"]).sum()
-finished = total_runs - running_count
-success_rate = f"{(success_count / finished * 100):.0f}%" if finished else "—"
-avg_duration = fmt_duration(filtered["duration_seconds"].mean()) if "duration_seconds" in filtered and finished else "—"
+runs_df = runs_df[runs_df["status"].apply(lambda s: status_matches(s, status_filter))]
 
-kpi_html = "".join(
-    f'<div class="kpi-item"><span class="kpi-label">{label}</span><span class="kpi-value">{value}</span></div>'
-    for label, value in [
-        ("Runs in view", total_runs),
-        ("Success rate", success_rate),
-        ("Failed", failed_count),
-        ("Running now", running_count),
-        ("Avg duration", avg_duration),
-    ]
-)
-st.markdown(f'<div class="kpi-strip">{kpi_html}</div>', unsafe_allow_html=True)
 
-# ── Run table (compact, scannable) ──────────────────────────────────────
-st.markdown(
-    f'<div class="section-label"><span>Run History</span><span class="coverage">{lookback.lower()}</span></div>',
-    unsafe_allow_html=True,
-)
+def render_kpi_strip(df: pd.DataFrame) -> None:
+    total = len(df)
+    status_lower = df["status"].str.lower() if total else pd.Series(dtype=str)
+    success_count = status_lower.isin(["success", "completed"]).sum()
+    failed_count = status_lower.isin(["failed", "error"]).sum()
+    running_count = status_lower.isin(["running", "in_progress", "started"]).sum()
+    finished = total - running_count
+    success_rate = f"{(success_count / finished * 100):.0f}%" if finished else "—"
+    avg_duration = fmt_duration(df["duration_seconds"].mean()) if "duration_seconds" in df and finished else "—"
+    kpi_html = "".join(
+        f'<div class="kpi-item"><span class="kpi-label">{label}</span><span class="kpi-value">{value}</span></div>'
+        for label, value in [
+            ("Runs in view", total), ("Success rate", success_rate),
+            ("Failed", failed_count), ("Running now", running_count), ("Avg duration", avg_duration),
+        ]
+    )
+    st.markdown(f'<div class="kpi-strip">{kpi_html}</div>', unsafe_allow_html=True)
 
-if filtered.empty:
-    st.info("No runs match the current filters.")
-else:
-    table_df = filtered.copy()
+
+def render_run_table_and_detail(df: pd.DataFrame, key_prefix: str) -> None:
+    """Standard run-history table + drill-down, scoped to one job's runs."""
+    if df.empty:
+        st.info("No runs match the current filters.")
+        return
+
+    table_df = df.copy()
     table_df["Status"] = table_df["status"].apply(lambda s: f'{status_meta(s)["dot"]} {status_meta(s)["label"]}')
     table_df["Started"] = table_df["started_at"].dt.strftime("%b %d, %H:%M:%S")
     table_df["Duration"] = table_df["duration_seconds"].apply(fmt_duration)
@@ -359,29 +396,25 @@ else:
     table_df["Message"] = table_df.apply(
         lambda r: clean_str(r.get("error_message")) or clean_str(r.get("message")) or "", axis=1
     )
-    display_df = table_df[["Status", "job_name", "Started", "Duration", "Rows", "Message"]].rename(
-        columns={"job_name": "Job"}
-    )
+    display_df = table_df[["Status", "Started", "Duration", "Rows", "Message"]]
 
     st.dataframe(
-        display_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Message": st.column_config.TextColumn("Message", width="large"),
-        },
+        display_df, hide_index=True, use_container_width=True,
+        column_config={"Message": st.column_config.TextColumn("Message", width="large")},
     )
 
-    # ── Drill-down: pick a run to see its full detail (error, links, training data) ──
     run_labels = {
-        f'#{r["id"]} · {r["job_name"]} · {status_meta(r["status"])["label"]} · {r["started_at"].strftime("%b %d %H:%M:%S")}': r["id"]
-        for _, r in filtered.iterrows()
+        f'#{r["id"]} · {status_meta(r["status"])["label"]} · {r["started_at"].strftime("%b %d %H:%M:%S")}': r["id"]
+        for _, r in df.iterrows()
     }
     st.markdown('<div class="section-label"><span>Run Detail</span></div>', unsafe_allow_html=True)
-    picked_label = st.selectbox("Inspect run", list(run_labels.keys()), label_visibility="collapsed")
+    picked_label = st.selectbox("Inspect run", list(run_labels.keys()), label_visibility="collapsed", key=f"{key_prefix}-picker")
     picked_id = run_labels[picked_label]
-    run = filtered[filtered["id"] == picked_id].iloc[0]
+    run = df[df["id"] == picked_id].iloc[0]
+    render_run_detail(run, picked_id, key_prefix)
 
+
+def render_run_detail(run: pd.Series, picked_id, key_prefix: str) -> None:
     meta = status_meta(run.get("status"))
     top = st.columns([1, 1, 1, 2])
     top[0].markdown(f'<span style="color:{meta["color"]};font-family:{MONO};">{meta["dot"]} {meta["label"]}</span>', unsafe_allow_html=True)
@@ -408,7 +441,68 @@ else:
     if not details_df.empty and "pipeline_run_id" in details_df.columns:
         matches = details_df[details_df["pipeline_run_id"] == picked_id]
         for _, td in matches.iterrows():
-            render_training_detail(td, row_key=str(picked_id))
+            render_training_detail(td, row_key=f"{key_prefix}-{picked_id}")
+
+
+# ── Tabs: one per job, Scraper+Embedder sharing a paired view ─────────────
+tab_pipeline, tab_market, tab_trainer = st.tabs(["🔗 Scraper → Embedder", "📈 Market Data Updater", "🧠 Trainer"])
+
+with tab_pipeline:
+    st.caption("Embedder is triggered by a successful scraper run (GitHub Actions `workflow_run`), not on its own schedule — so each row below pairs a scrape with the embed it kicked off.")
+    pair_source = runs_df[runs_df["job_name"].isin(["scraper", "embedder"])]
+    render_kpi_strip(pair_source)
+
+    pairs = pair_scraper_embedder(pair_source)
+    if not pairs:
+        st.info("No scraper/embedder runs match the current filters.")
+    else:
+        rows = []
+        for p in pairs:
+            s, e, gap = p["scraper"], p["embedder"], p["gap"]
+            rows.append({
+                "Started": s["started_at"].strftime("%b %d, %H:%M:%S") if s is not None else (e["started_at"].strftime("%b %d, %H:%M:%S") if e is not None else "—"),
+                "Scraper": f'{status_meta(s["status"])["dot"]} {status_meta(s["status"])["label"]}' if s is not None else "—",
+                "Scraped rows": int(s["rows_processed"]) if s is not None and has_value(s.get("rows_processed")) else 0,
+                "→": "→",
+                "Embedder": f'{status_meta(e["status"])["dot"]} {status_meta(e["status"])["label"]}' if e is not None else "no run yet",
+                "Gap to embed": fmt_duration(gap) if gap is not None else "—",
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        st.markdown('<div class="section-label"><span>Run Detail</span></div>', unsafe_allow_html=True)
+        pair_labels = {}
+        for i, p in enumerate(pairs):
+            s, e = p["scraper"], p["embedder"]
+            label = f'#{s["id"] if s is not None else "—"} scraper' + (f' → #{e["id"]} embedder' if e is not None else " (no embed yet)")
+            label += f' · {(s["started_at"] if s is not None else e["started_at"]).strftime("%b %d %H:%M:%S")}'
+            pair_labels[label] = i
+        picked_label = st.selectbox("Inspect pair", list(pair_labels.keys()), label_visibility="collapsed", key="pair-picker")
+        chosen = pairs[pair_labels[picked_label]]
+        leg1, leg2 = st.columns(2)
+        with leg1:
+            st.markdown(f'<span style="font-family:{MONO};color:{GOLD};font-size:0.7rem;letter-spacing:0.08em;">SCRAPER</span>', unsafe_allow_html=True)
+            if chosen["scraper"] is not None:
+                render_run_detail(chosen["scraper"], chosen["scraper"]["id"], "pair-scraper")
+            else:
+                st.caption("No scraper run in this pair.")
+        with leg2:
+            st.markdown(f'<span style="font-family:{MONO};color:{GOLD};font-size:0.7rem;letter-spacing:0.08em;">EMBEDDER</span>', unsafe_allow_html=True)
+            if chosen["embedder"] is not None:
+                render_run_detail(chosen["embedder"], chosen["embedder"]["id"], "pair-embedder")
+            else:
+                st.caption("Embedder hasn't run for this scrape yet.")
+
+with tab_market:
+    market_df = runs_df[runs_df["job_name"] == "market_data_updater"]
+    render_kpi_strip(market_df)
+    st.markdown('<div class="section-label"><span>Run History</span></div>', unsafe_allow_html=True)
+    render_run_table_and_detail(market_df, "market")
+
+with tab_trainer:
+    trainer_df = runs_df[runs_df["job_name"] == "trainer"]
+    render_kpi_strip(trainer_df)
+    st.markdown('<div class="section-label"><span>Run History</span></div>', unsafe_allow_html=True)
+    render_run_table_and_detail(trainer_df, "trainer")
 
 st.markdown(
     '<div class="disclaimer">Auto-refreshes every 60s from Supabase. '
