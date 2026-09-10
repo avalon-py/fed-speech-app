@@ -60,7 +60,10 @@ st.markdown(
         --bear:       #B84C3E;
     }
 
-    .stApp, .stApp p, .stApp label, .stApp span { font-family: 'Inter', sans-serif; }
+    .stApp, .stApp p, .stApp label,
+    .stApp span:not([data-testid="stIconMaterial"]) {
+        font-family: 'Inter', sans-serif;
+    }
     [data-testid="stHeader"] { background: transparent; height: 2.2rem; }
     .block-container { padding-top: 0.3rem !important; padding-bottom: 0.6rem !important; }
 
