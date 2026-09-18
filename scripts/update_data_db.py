@@ -208,14 +208,16 @@ def validate_macro(df: pd.DataFrame, today: pd.Timestamp) -> None:
 # Price action (yfinance) — same story as macro above.
 # ---------------------------------------------------------------------------
 
+PRICE_FFILL_ANCHOR_DAYS = 14  # buffer so ffill always has a pre-window anchor across holidays
+
 def fetch_prices(today: pd.Timestamp, last_date: "pd.Timestamp | None") -> pd.DataFrame:
     if last_date is None:
         start = BOOTSTRAP_START
-        log("no existing price data — bootstrapping full history (one-time only). "
-            "NOTE: this will NOT replicate the pre-2000 XAUUSD gold patch from "
-            "TOOLS_get_prices.ipynb — flagging in case this branch ever actually runs.")
+        merge_floor = None
+        log("no existing price data — bootstrapping full history (one-time only). ...")
     else:
-        start = (last_date - timedelta(days=SELF_HEAL_DAYS)).strftime("%Y-%m-%d")
+        start = (last_date - timedelta(days=PRICE_FFILL_ANCHOR_DAYS)).strftime("%Y-%m-%d")
+        merge_floor = last_date - timedelta(days=SELF_HEAL_DAYS)
 
     end = (today + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -235,9 +237,11 @@ def fetch_prices(today: pd.Timestamp, last_date: "pd.Timestamp | None") -> pd.Da
     prices = prices.reindex(full_index).ffill()
     prices = prices.reset_index().rename(columns={"index": "date"})
 
+    if merge_floor is not None:
+        prices = prices[prices["date"] >= merge_floor].reset_index(drop=True)
+
     return prices
-
-
+  
 def validate_prices(df: pd.DataFrame, today: pd.Timestamp) -> None:
     expected_cols = {"date", "SPX", "TNX", "GOLD", "VIX", "DXY"}
     if set(df.columns) != expected_cols:
